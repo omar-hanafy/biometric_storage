@@ -3,6 +3,7 @@ package design.codeux.biometric_storage
 import android.app.Activity
 import android.content.Context
 import android.os.*
+import android.security.KeyStoreException
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.UserNotAuthenticatedException
 import androidx.annotation.AnyThread
@@ -195,7 +196,10 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                     // user requires authentication.
                     try {
                         return cb(null)
-                    } catch (e: UserNotAuthenticatedException) {
+                    } catch (e: Throwable) {
+                        if (!isUserNotAuthenticatedError(e)) {
+                            throw e
+                        }
                         logger.debug(e) { "User requires (re)authentication. showing prompt ..." }
                     }
                 }
@@ -423,6 +427,27 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
         } else {
             prompt.authenticate(promptBuilder.build(), BiometricPrompt.CryptoObject(cipher))
         }
+    }
+
+    private fun isUserNotAuthenticatedError(error: Throwable): Boolean {
+        if (error is UserNotAuthenticatedException) return true
+
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is KeyStoreException) {
+                val message = current.message?.lowercase()
+                if (message != null && message.contains("not authenticated")) {
+                    return true
+                }
+            }
+            val message = current.message?.lowercase()
+            if (message != null && message.contains("not authenticated")) {
+                return true
+            }
+            current = current.cause
+        }
+
+        return false
     }
 
     override fun onDetachedFromActivity() {
