@@ -86,7 +86,7 @@ class StorageFileInitOptions {
   StorageFileInitOptions({
     Duration? androidAuthenticationValidityDuration,
     Duration? darwinTouchIDAuthenticationAllowableReuseDuration,
-    this.darwinTouchIDAuthenticationForceReuseContextDuration,
+    Duration? darwinTouchIDAuthenticationForceReuseContextDuration,
     @Deprecated(
         'use use androidAuthenticationValidityDuration, iosTouchIDAuthenticationAllowableReuseDuration or iosTouchIDAuthenticationForceReuseContextDuration instead')
     int authenticationValidityDurationSeconds = -1,
@@ -100,6 +100,12 @@ class StorageFileInitOptions {
                     : Duration(seconds: authenticationValidityDurationSeconds)),
         darwinTouchIDAuthenticationAllowableReuseDuration =
             darwinTouchIDAuthenticationAllowableReuseDuration ??
+                (authenticationValidityDurationSeconds <= 0
+                    ? null
+                    : Duration(seconds: authenticationValidityDurationSeconds)),
+        darwinTouchIDAuthenticationForceReuseContextDuration =
+            darwinTouchIDAuthenticationForceReuseContextDuration ??
+                darwinTouchIDAuthenticationAllowableReuseDuration ??
                 (authenticationValidityDurationSeconds <= 0
                     ? null
                     : Duration(seconds: authenticationValidityDurationSeconds));
