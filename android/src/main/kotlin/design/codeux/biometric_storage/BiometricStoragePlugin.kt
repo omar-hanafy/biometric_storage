@@ -205,17 +205,8 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                 }
 
                 val promptInfo = getAndroidPromptInfo()
-                val cipherForPrompt = cipher ?: try {
-                    cipherForMode()
-                } catch (e: KeyPermanentlyInvalidatedException) {
-                    // TODO should we communicate this to the caller?
-                    logger.warn(e) { "Key was invalidated. removing previous storage and recreating." }
-                    deleteFile()
-                    // if deleting fails, simply throw the second time around.
-                    cipherForMode()
-                }
-                authenticate(cipherForPrompt, promptInfo, options, { authenticatedCipher ->
-                    cb(authenticatedCipher ?: cipherForPrompt)
+                authenticate(cipher, promptInfo, options, { authenticatedCipher ->
+                    cb(authenticatedCipher ?: cipher)
                 }, onError = resultError)
             }
 
@@ -429,7 +420,8 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
             promptBuilder.setAllowedAuthenticators(DEVICE_CREDENTIAL or BIOMETRIC_STRONG)
         }
 
-        if (cipher == null) {
+        if (cipher == null || options.androidAuthenticationValidityDuration != null) {
+            // if androidAuthenticationValidityDuration is not null we can't use a CryptoObject
             logger.debug { "Authenticating without cipher. ${options.androidAuthenticationValidityDuration}" }
             prompt.authenticate(promptBuilder.build())
         } else {
