@@ -120,7 +120,7 @@ class BiometricStorageFile(
                 logger.debug { "read ${bytes.size}" }
                 cryptographyManager.decryptData(bytes, useCipher)
             } catch (ex: IOException) {
-                logger.error(ex) { "Error while writing encrypted file $fileV2" }
+                logger.error(ex) { "Error while reading encrypted file $fileV2" }
                 null
             }
         }

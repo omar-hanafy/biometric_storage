@@ -68,7 +68,7 @@ enum class AuthenticationError(vararg val code: Int) {
 
     companion object {
         fun forCode(code: Int) =
-            values().firstOrNull { it.code.contains(code) } ?: Unknown
+            entries.firstOrNull { it.code.contains(code) } ?: Unknown
     }
 }
 
@@ -150,9 +150,31 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                 val name = getName()
                 storageFiles[name]?.apply(cb) ?: run {
                     logger.warn { "User tried to access storage '$name', before initialization" }
-                    result.error("Storage $name was not initialized.", null, null)
+                    result.error("NoSuchStorage", "Storage $name was not initialized.", null)
                     return
                 }
+            }
+
+            fun Result.sendStorageFailure(exception: MethodCallException) {
+                error(exception.errorCode, exception.errorMessage, exception.errorDetails)
+            }
+
+            fun storageFailure(error: Throwable): MethodCallException? = when (error) {
+                is MethodCallException -> error
+                is InvalidatedStorageKeyException,
+                is KeyPermanentlyInvalidatedException -> MethodCallException(
+                    "StorageError:KeyInvalidated",
+                    "The Android Keystore entry was invalidated. Recreate the storage and write the secret again.",
+                    error.toCompleteString()
+                )
+
+                is CorruptedStorageDataException -> MethodCallException(
+                    "StorageError:CorruptedData",
+                    error.message,
+                    error.toCompleteString()
+                )
+
+                else -> null
             }
 
             val resultError: ErrorCallback = { errorInfo ->
@@ -183,12 +205,9 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                     null
                 } else try {
                     cipherForMode()
-                } catch (e: KeyPermanentlyInvalidatedException) {
-                    // TODO should we communicate this to the caller?
-                    logger.warn(e) { "Key was invalidated. removing previous storage and recreating." }
-                    deleteFile()
-                    // if deleting fails, simply throw the second time around.
-                    cipherForMode()
+                } catch (e: Throwable) {
+                    storageFailure(e)?.let { throw it }
+                    throw e
                 }
 
                 if (cipher == null) {
@@ -254,10 +273,14 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                 "read" -> withStorage {
                     if (exists()) {
                         withAuth(CipherMode.Decrypt) {
-                            val ret = readFile(
-                                it,
-                            )
-                            ui(resultError) { result.success(ret) }
+                            try {
+                                val ret = readFile(it)
+                                ui(resultError) { result.success(ret) }
+                            } catch (e: Throwable) {
+                                storageFailure(e)?.let { failure ->
+                                    ui(resultError) { result.sendStorageFailure(failure) }
+                                } ?: throw e
+                            }
                         }
                     } else {
                         result.success(null)
@@ -274,8 +297,14 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
 
                 "write" -> withStorage {
                     withAuth(CipherMode.Encrypt) {
-                        writeFile(it, requiredArgument(PARAM_WRITE_CONTENT))
-                        ui(resultError) { result.success(true) }
+                        try {
+                            writeFile(it, requiredArgument(PARAM_WRITE_CONTENT))
+                            ui(resultError) { result.success(true) }
+                        } catch (e: Throwable) {
+                            storageFailure(e)?.let { failure ->
+                                ui(resultError) { result.sendStorageFailure(failure) }
+                            } ?: throw e
+                        }
                     }
                 }
 
@@ -342,12 +371,12 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                 DEVICE_CREDENTIAL or BIOMETRIC_STRONG
             }
         )
-        return CanAuthenticateResponse.values().firstOrNull { it.code == response }
+        return CanAuthenticateResponse.entries.firstOrNull { it.code == response }
             ?: throw Exception(
                 "Unknown response code {$response} (available: ${
                     CanAuthenticateResponse
-                        .values()
-                        .contentToString()
+                        .entries
+                        .joinToString()
                 }"
             )
     }

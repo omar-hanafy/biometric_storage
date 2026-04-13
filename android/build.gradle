@@ -23,7 +23,6 @@ rootProject.allprojects {
 
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
-apply plugin: 'kotlin-kapt'
 
 kotlin {
     jvmToolchain(17)
@@ -50,13 +49,13 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles 'proguard.pro'
     }
-    lintOptions {
+    lint {
         disable 'InvalidPackage'
     }
 }
 
 dependencies {
-    def biometric_version = "1.4.0-alpha02"
+    def biometric_version = "1.1.0"
 
     api "androidx.core:core-ktx:1.10.1"
     api "androidx.fragment:fragment-ktx:1.6.1"

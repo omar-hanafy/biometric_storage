@@ -16,13 +16,13 @@ class InitOptions {
   init(params: [String: Any]) {
     darwinTouchIDAuthenticationAllowableReuseDuration = params["darwinTouchIDAuthenticationAllowableReuseDurationSeconds"] as? Int
     darwinTouchIDAuthenticationForceReuseContextDuration = params["darwinTouchIDAuthenticationForceReuseContextDurationSeconds"] as? Int
-    authenticationRequired = params["authenticationRequired"] as? Bool
-    darwinBiometricOnly = params["darwinBiometricOnly"] as? Bool
+    authenticationRequired = params["authenticationRequired"] as? Bool ?? true
+    darwinBiometricOnly = params["darwinBiometricOnly"] as? Bool ?? true
   }
   let darwinTouchIDAuthenticationAllowableReuseDuration: Int?
   let darwinTouchIDAuthenticationForceReuseContextDuration: Int?
-  let authenticationRequired: Bool!
-  let darwinBiometricOnly: Bool!
+  let authenticationRequired: Bool
+  let darwinBiometricOnly: Bool
 }
 
 class IOSPromptInfo {
@@ -54,9 +54,10 @@ class BiometricStorageImpl {
   }
 
   public func handle(_ call: StorageMethodCall, result: @escaping StorageCallback) {
-    
+    let args = call.arguments as? [String: Any]
+
     func requiredArg<T>(_ name: String, _ cb: (T) -> Void) {
-      guard let args = call.arguments as? Dictionary<String, Any> else {
+      guard let args else {
         result(storageError(code: "InvalidArguments", message: "Invalid arguments \(String(describing: call.arguments))", details: nil))
         return
       }
@@ -71,9 +72,14 @@ class BiometricStorageImpl {
       cb(valueTyped)
       return
     }
+
+    func optionalArg<T>(_ name: String) -> T? {
+      args?[name] as? T
+    }
+
     func requireStorage(_ name: String, _ cb: (BiometricStorageFile) -> Void) {
       guard let file = stores[name] else {
-        result(storageError(code: "InvalidArguments", message: "Storage was not initialized \(name)", details: nil))
+        result(storageError(code: "NoSuchStorage", message: "Storage \(name) was not initialized.", details: nil))
         return
       }
       cb(file)
@@ -85,15 +91,37 @@ class BiometricStorageImpl {
         canAuthenticate(options: initOptions, result: result)
       }
     } else if ("init" == call.method) {
-      requiredArg("name") { name in
-        requiredArg("options") { options in
-          stores[name] = BiometricStorageFile(name: name, initOptions: InitOptions(params: options), storageError: storageError)
+      requiredArg("name") { (name: String) in
+        requiredArg("options") { (options: [String: Any]) in
+          let forceInit: Bool = optionalArg("forceInit") ?? false
+          if stores[name] != nil {
+            if forceInit {
+              result(storageError(
+                code: "AlreadyInitialized",
+                message: "A storage file with the name '\(name)' was already initialized.",
+                details: nil
+              ))
+            } else {
+              result(false)
+            }
+            return
+          }
+          stores[name] = BiometricStorageFile(
+            name: name,
+            initOptions: InitOptions(params: options),
+            storageError: storageError
+          )
+          result(true)
         }
       }
-      result(true)
     } else if ("dispose" == call.method) {
-      // nothing to dispose
-      result(true)
+      requiredArg("name") { (name: String) in
+        guard stores.removeValue(forKey: name) != nil else {
+          result(storageError(code: "NoSuchStorage", message: "Tried to dispose non existing storage.", details: nil))
+          return
+        }
+        result(true)
+      }
     } else if ("read" == call.method) {
       requiredArg("name") { name in
         requiredArg("iosPromptInfo") { promptInfo in
@@ -141,13 +169,13 @@ class BiometricStorageImpl {
     let laError = LAError(_nsError: err)
     NSLog("LAError: \(laError)");
     switch laError.code {
-    case .touchIDNotAvailable:
+    case .biometryNotAvailable, .touchIDNotAvailable:
       result("ErrorHwUnavailable")
       break;
     case .passcodeNotSet:
       result("ErrorPasscodeNotSet")
       break;
-    case .touchIDNotEnrolled:
+    case .biometryNotEnrolled, .touchIDNotEnrolled:
       result("ErrorNoBiometricEnrolled")
       break;
     case .invalidContext: fallthrough

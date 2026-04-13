@@ -2,19 +2,20 @@
 
 [![Pub](https://img.shields.io/pub/v/biometric_storage?color=green)](https://pub.dev/packages/biometric_storage/)
 
-Encrypted file store, **optionally** secured by biometric lock 
-for Android, iOS, MacOS and partial support for Linux, Windows and Web. 
+Encrypted file storage with optional biometric protection for Flutter apps.
+It is designed for small secrets such as passwords, tokens, and key material,
+not for large datasets.
 
-Meant as a way to store small data in a hardware encrypted fashion. E.g. to 
-store passwords, secret keys, etc. but not massive amounts
-of data.
+Release baseline for this repository:
+- Flutter `3.41.6`
+- Dart `3.11.4`
 
-* Android: Uses androidx with KeyStore.
-* iOS and MacOS: LocalAuthentication with KeyChain.
-* Linux: Stores values in Keyring using libsecret. (No biometric authentication support).
-* Windows: Uses [wincreds.h to store into read/write into credential store](https://docs.microsoft.com/en-us/windows/win32/api/wincred/).
-* Web: **Warning** Uses unauthenticated, **unencrypted** storage in localStorage.
-  If you have a better idea for secure storage on web platform, [please open an Issue](https://github.com/authpass/biometric_storage/issues).
+Platform behavior:
+- Android: AES-GCM via Android Keystore, optional biometric or device credential gating.
+- iOS and macOS: LocalAuthentication with Keychain access control.
+- Linux: libsecret keyring storage without biometric authentication.
+- Windows: Windows Credential Manager without biometric authentication.
+- Web: plaintext `localStorage` only. This is **not** secure storage.
 
 Check out [AuthPass Password Manager](https://authpass.app/) for a app which 
 makes heavy use of this plugin.
@@ -24,40 +25,33 @@ makes heavy use of this plugin.
 ### Installation
 
 #### Android
-* Requirements:
-  * Android: API Level >= 23 (android/app/build.gradle `minSdkVersion 23`)
-  * Make sure to use the latest kotlin version: 
-    * `android/build.gradle`: `ext.kotlin_version = '1.4.31'`
-  * MainActivity must extend FlutterFragmentActivity
-  * Theme for the main activity must use `Theme.AppCompat` thme.
-    (Otherwise there will be crashes on Android < 29)
-    For example: 
-    
-    **android/app/src/main/AndroidManifest.xml**:
-    ```xml
-    <activity
-        android:name=".MainActivity"
-        android:launchMode="singleTop"
-        android:theme="@style/LaunchTheme">
-        [...]
-        <meta-data
-              android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
-              />
-    </activity>
-    ```
+- Android API level `23+`.
+- Host activity must extend `FlutterFragmentActivity`.
+- The activity theme must inherit from `Theme.AppCompat`.
 
-    **android/app/src/main/res/values/styles.xml**:
-    ```xml
-    <resources>
-      <style name="LaunchTheme" parent="Theme.AppCompat.NoActionBar">
-        ...
-      </style>
-      <style name="NormalTheme" parent="Theme.AppCompat.NoActionBar">
-        ...
-      </style>
-    </resources>
-    ```
+Example:
+
+**android/app/src/main/AndroidManifest.xml**
+
+```xml
+<activity
+    android:name=".MainActivity"
+    android:launchMode="singleTop"
+    android:theme="@style/LaunchTheme">
+    <meta-data
+        android:name="io.flutter.embedding.android.NormalTheme"
+        android:resource="@style/NormalTheme" />
+</activity>
+```
+
+**android/app/src/main/res/values/styles.xml**
+
+```xml
+<resources>
+  <style name="LaunchTheme" parent="Theme.AppCompat.NoActionBar" />
+  <style name="NormalTheme" parent="Theme.AppCompat.NoActionBar" />
+</resources>
+```
 
 ##### Resources
 
@@ -68,19 +62,24 @@ makes heavy use of this plugin.
 
 https://developer.apple.com/documentation/localauthentication/logging_a_user_into_your_app_with_face_id_or_touch_id
 
-* include the NSFaceIDUsageDescription key in your app’s Info.plist file
-* Supports all iOS versions supported by Flutter. (ie. iOS 12)
+- Include the `NSFaceIDUsageDescription` key in your app `Info.plist`.
+- This release baseline targets Flutter `3.41.6`.
 
-**Known Issue**: since iOS 15 the simulator seem to no longer support local authentication:
-    https://developer.apple.com/forums/thread/685773
+**Known issue**: local authentication in the iOS simulator is unreliable on recent iOS versions:
+https://developer.apple.com/forums/thread/685773
 
 #### Mac OS
 
-* include the NSFaceIDUsageDescription key in your app’s Info.plist file
-* enable keychain sharing and signing. (not sure why this is required. but without it
-    You will probably see an error like: 
-    > SecurityError, Error while writing data: -34018: A required entitlement isn't present.
-* Supports all MacOS Versions supported by Flutter (ie. >= MacOS 10.14)
+- Include the `NSFaceIDUsageDescription` key in your app `Info.plist` if you rely on biometrics.
+- Enable signing and Keychain sharing for the host app. Without that you will likely see:
+  `SecurityError, Error while writing data: -34018: A required entitlement isn't present.`
+- This release baseline targets Flutter `3.41.6`.
+
+#### Windows, Linux, and web
+
+- Linux and Windows currently provide secure OS-backed storage, but no biometric prompt.
+- Web currently stores plaintext values in browser `localStorage`.
+  Do not treat the web implementation as secure storage.
 
 ### Usage
 
@@ -98,20 +97,20 @@ https://developer.apple.com/documentation/localauthentication/logging_a_user_int
 2. Create the access object
 
 ```dart
-  final store = BiometricStorage().getStorage('mystorage');
+  final store = await BiometricStorage().getStorage('mystorage');
 ```
 
 3. Read data
 
 ```dart
-  final data = await storageFile.read();
+  final data = await store.read();
 ```
 
 4. Write data
 
 ```dart
   final myNewData = 'Hello World';
-  await storageFile.write(myNewData);
+  await store.write(myNewData);
 ```
 
 See also the API documentation: https://pub.dev/documentation/biometric_storage/latest/biometric_storage/BiometricStorageFile-class.html#instance-methods

@@ -1,6 +1,11 @@
 ## 5.1.1-dev.2
 
-* Improve `canAuthenticate` to include `InitOptions` to decide for which authenticaiton type to check.
+* Improve `canAuthenticate` to include `InitOptions` to decide for which authentication type to check.
+* Align the package with the Flutter `3.41.6` and Dart `3.11.4` release baseline.
+* Fix the Windows implementation for `win32` `6.x`.
+* Make Darwin storage lifecycle behavior consistent with Android for `init` and `dispose`.
+* Harden Android encrypted file validation and error reporting for malformed or invalidated data.
+* Refresh podspec metadata, README guidance, and release workflows.
 
 ## 5.1.0
 

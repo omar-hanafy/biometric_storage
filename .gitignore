@@ -1,17 +1,5 @@
 
-# https://gist.github.com/hpoul/b78f7a1b3cde988f3ce4d12e954367eb
-#
-# IDEA: Allow some configuration, which is shared across users.
-
-/.idea/*
-!.idea/runConfigurations
-!.idea/runConfigurations/*
-!.idea/vcs.xml
-!.idea/dictionaries
-!.idea/dictionaries/*
-!.idea/inspectionProfiles/*
-!.idea/codeStyles
-!.idea/codeStyles/*
+.idea/
 *.iml
 
 # Java/Kotlin/Android
@@ -27,6 +15,7 @@
 #### project specific ignores below
 
 /pubspec.lock
+/example/pubspec.lock
 
 .DS_Store
 .dart_tool/
@@ -39,9 +28,9 @@ android/.idea
 
 .flutter-plugins-dependencies
 example/android/app/_debug-full-r8-config.txt
+example/ios/Flutter/ephemeral/
 
 
 .vscode
 
 .gradletasknamecache
-

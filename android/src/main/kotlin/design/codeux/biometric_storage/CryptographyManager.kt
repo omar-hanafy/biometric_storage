@@ -20,17 +20,29 @@ package design.codeux.biometric_storage
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.File
+import java.io.IOException
 import java.nio.charset.Charset
+import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.security.KeyStoreException
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 private val logger = KotlinLogging.logger {}
+
+open class StorageException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+class CorruptedStorageDataException(message: String, cause: Throwable? = null) :
+    StorageException(message, cause)
+
+class InvalidatedStorageKeyException(message: String, cause: Throwable? = null) :
+    StorageException(message, cause)
 
 interface CryptographyManager {
 
@@ -89,28 +101,51 @@ class CryptographyManagerImpl(
     }
 
     override fun getInitializedCipherForEncryption(keyName: String): Cipher {
-        val cipher = getCipher()
-        val secretKey = getOrCreateSecretKey(keyName)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-        return cipher
+        try {
+            val cipher = getCipher()
+            val secretKey = getOrCreateSecretKey(keyName)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            return cipher
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            throw InvalidatedStorageKeyException(
+                "The Android Keystore entry for '$keyName' was invalidated.",
+                e
+            )
+        }
     }
 
     override fun getInitializedCipherForDecryption(
         keyName: String,
         initializationVector: ByteArray
     ): Cipher {
-        val cipher = getCipher()
-        val secretKey = getOrCreateSecretKey(keyName)
-        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_SIZE_IN_BYTES * 8, initializationVector))
-        return cipher
+        try {
+            val cipher = getCipher()
+            val secretKey = getOrCreateSecretKey(keyName)
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                secretKey,
+                GCMParameterSpec(TAG_SIZE_IN_BYTES * 8, initializationVector)
+            )
+            return cipher
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            throw InvalidatedStorageKeyException(
+                "The Android Keystore entry for '$keyName' was invalidated.",
+                e
+            )
+        }
     }
+
     override fun getInitializedCipherForDecryption(
         keyName: String,
         encryptedDataFile: File,
     ): Cipher {
         val iv = ByteArray(IV_SIZE_IN_BYTES)
-        val count = encryptedDataFile.inputStream().read(iv)
-        assert(count == IV_SIZE_IN_BYTES)
+        val count = encryptedDataFile.inputStream().use { it.read(iv) }
+        if (count != IV_SIZE_IN_BYTES) {
+            throw CorruptedStorageDataException(
+                "Encrypted payload is truncated and does not contain a complete IV."
+            )
+        }
         return getInitializedCipherForDecryption(keyName, iv)
     }
 
@@ -119,21 +154,47 @@ class CryptographyManagerImpl(
         val ciphertext = ByteArray(IV_SIZE_IN_BYTES + input.size + TAG_SIZE_IN_BYTES)
         val bytesWritten = cipher.doFinal(input, 0, input.size, ciphertext, IV_SIZE_IN_BYTES)
         cipher.iv.copyInto(ciphertext)
-        assert(bytesWritten == input.size + TAG_SIZE_IN_BYTES)
-        assert(cipher.iv.size == IV_SIZE_IN_BYTES)
+        if (bytesWritten != input.size + TAG_SIZE_IN_BYTES) {
+            throw IOException("Cipher output length did not match the expected AES-GCM payload size.")
+        }
+        if (cipher.iv.size != IV_SIZE_IN_BYTES) {
+            throw IOException("Cipher IV length ${cipher.iv.size} did not match expected size $IV_SIZE_IN_BYTES.")
+        }
         logger.debug { "encrypted ${input.size} (${ciphertext.size} output)" }
-//        val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
         return EncryptedData(ciphertext)
     }
 
     override fun decryptData(ciphertext: ByteArray, cipher: Cipher): String {
         logger.debug { "decrypting ${ciphertext.size} bytes (iv: ${IV_SIZE_IN_BYTES}, tag: ${TAG_SIZE_IN_BYTES})" }
+        if (ciphertext.size < IV_SIZE_IN_BYTES + TAG_SIZE_IN_BYTES) {
+            throw CorruptedStorageDataException(
+                "Encrypted payload is too short to contain both IV and authentication tag."
+            )
+        }
         val iv = ciphertext.sliceArray(IntRange(0, IV_SIZE_IN_BYTES - 1))
         if (!iv.contentEquals(cipher.iv)) {
-            throw IllegalStateException("expected first bytes of ciphertext to equal cipher iv.")
+            throw CorruptedStorageDataException(
+                "Encrypted payload IV does not match the initialized cipher IV."
+            )
         }
-        val plaintext = cipher.doFinal(ciphertext, IV_SIZE_IN_BYTES, ciphertext.size - IV_SIZE_IN_BYTES)
-        return String(plaintext, Charset.forName("UTF-8"))
+        try {
+            val plaintext = cipher.doFinal(
+                ciphertext,
+                IV_SIZE_IN_BYTES,
+                ciphertext.size - IV_SIZE_IN_BYTES
+            )
+            return String(plaintext, Charset.forName("UTF-8"))
+        } catch (e: AEADBadTagException) {
+            throw CorruptedStorageDataException(
+                "Encrypted payload failed the authentication tag check.",
+                e
+            )
+        } catch (e: GeneralSecurityException) {
+            throw CorruptedStorageDataException(
+                "Encrypted payload could not be decrypted safely.",
+                e
+            )
+        }
     }
 
     private fun getCipher(): Cipher {
