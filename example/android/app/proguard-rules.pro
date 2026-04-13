@@ -1,1 +1,0 @@
--printconfiguration _debug-full-r8-config.txt
