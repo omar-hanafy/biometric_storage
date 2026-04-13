@@ -1,0 +1,22 @@
+PODS:
+  - biometric_storage (5.1.1-dev.2):
+    - Flutter
+  - Flutter (1.0.0)
+
+DEPENDENCIES:
+  - biometric_storage (from `.symlinks/plugins/biometric_storage/ios`)
+  - Flutter (from `Flutter`)
+
+EXTERNAL SOURCES:
+  biometric_storage:
+    :path: ".symlinks/plugins/biometric_storage/ios"
+  Flutter:
+    :path: Flutter
+
+SPEC CHECKSUMS:
+  biometric_storage: 91a28ada0e40b6aa7c26d22050272ee0602a2c85
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+
+PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e
+
+COCOAPODS: 1.16.2
