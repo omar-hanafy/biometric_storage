@@ -10,17 +10,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('Verify Platform version', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
+  testWidgets('renders example app shell', (WidgetTester tester) async {
     await tester.pumpWidget(const MyApp());
 
-    // Verify that platform version is retrieved.
-    expect(
-      find.byWidgetPredicate(
-        (Widget widget) =>
-            widget is Text && widget.data!.startsWith('Running on:'),
-      ),
-      findsOneWidget,
-    );
+    expect(find.text('Plugin example app'), findsOneWidget);
+    expect(find.text('Methods:'), findsOneWidget);
+    expect(find.widgetWithText(ElevatedButton, 'init'), findsOneWidget);
   });
 }
