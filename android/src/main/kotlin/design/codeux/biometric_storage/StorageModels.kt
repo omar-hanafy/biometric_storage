@@ -52,6 +52,9 @@ enum class CanAuthenticateResponse {
     /** Neither a biometric nor a device credential is set up. */
     ErrorPasscodeNotSet,
 
+    /** Biometrics are unusable until a security update is installed. */
+    ErrorSecurityUpdateRequired,
+
     /** Maps to `CanAuthenticateResponse.unsupported` on the Dart side. */
     ErrorUnknown,
     ;
@@ -62,9 +65,8 @@ enum class CanAuthenticateResponse {
             BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> ErrorHwUnavailable
             BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> ErrorNoBiometricEnrolled
             BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> ErrorNoHardware
-            // Biometrics are unusable until a security update is installed;
-            // "hardware unavailable" is the closest supported wire name.
-            BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> ErrorHwUnavailable
+            BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED ->
+                ErrorSecurityUpdateRequired
             BiometricManager.BIOMETRIC_ERROR_UNSUPPORTED -> ErrorUnknown
             BiometricManager.BIOMETRIC_STATUS_UNKNOWN -> ErrorStatusUnknown
             else -> ErrorStatusUnknown
@@ -74,20 +76,48 @@ enum class CanAuthenticateResponse {
 
 /**
  * Error group reported to Dart as the `AuthError:<name>` error code.
- * The Dart side maps [UserCanceled], [Canceled] and [Timeout] to dedicated
- * exception codes; every other name maps to `AuthExceptionCode.unknown`.
+ * The wire format is the constant name and every name has a dedicated
+ * `AuthExceptionCode` value on the Dart side which matches on the exact
+ * string, so constants must never be renamed and new ones require a
+ * Dart-side mapping first.
  */
 enum class AuthenticationError(private vararg val codes: Int) {
     Canceled(BiometricPrompt.ERROR_CANCELED),
     Timeout(BiometricPrompt.ERROR_TIMEOUT),
     UserCanceled(BiometricPrompt.ERROR_USER_CANCELED, BiometricPrompt.ERROR_NEGATIVE_BUTTON),
 
-    /** Too many failed attempts; locked out temporarily or until credential unlock. */
-    LockedOut(BiometricPrompt.ERROR_LOCKOUT, BiometricPrompt.ERROR_LOCKOUT_PERMANENT),
+    /** Too many failed attempts; locked out temporarily, retrying later may work. */
+    LockedOut(BiometricPrompt.ERROR_LOCKOUT),
+
+    /**
+     * Locked out from too many [LockedOut] lockouts; biometrics stay disabled
+     * until the user unlocks the device with their PIN, pattern or password.
+     */
+    LockedOutPermanently(BiometricPrompt.ERROR_LOCKOUT_PERMANENT),
+
+    /** The sensor could not process the current attempt; the user may retry. */
+    AuthenticationFailed(BiometricPrompt.ERROR_UNABLE_TO_PROCESS),
+
+    /** No biometrics are enrolled on this device. */
+    NoBiometricEnrolled(BiometricPrompt.ERROR_NO_BIOMETRICS),
+
+    /** The device has no biometric hardware. */
+    NoHardware(BiometricPrompt.ERROR_HW_NOT_PRESENT),
+
+    /** The biometric hardware is currently unavailable; retrying later may work. */
+    HardwareUnavailable(BiometricPrompt.ERROR_HW_UNAVAILABLE),
+
+    /** A device credential was requested but no PIN, pattern or password is set up. */
+    PasscodeNotSet(BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL),
+
+    /** The biometric sensors are unusable until a security update is installed. */
+    SecurityUpdateRequired(BiometricPrompt.ERROR_SECURITY_UPDATE_REQUIRED),
+
+    /** Fallback for ERROR_NO_SPACE, ERROR_VENDOR and any unmapped code. */
     Unknown(-1),
 
-    /** The authentication flow could not be started at all. */
-    Failed(-2),
+    /** The flow could not be started at all, e.g. without a FragmentActivity. */
+    FailedToStart(-2),
     ;
 
     companion object {

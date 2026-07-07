@@ -219,7 +219,7 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
             if (activity == null) {
                 StorageLog.e("Cannot show a biometric prompt without a foreground FragmentActivity.")
                 result.error(
-                    "AuthError:${AuthenticationError.Failed}",
+                    "AuthError:${AuthenticationError.FailedToStart}",
                     "Plugin is not attached to a FragmentActivity. " +
                         "Use FlutterFragmentActivity in your app.",
                     null,

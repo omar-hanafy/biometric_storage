@@ -58,4 +58,5 @@ dependencies {
     // toolchain does not support yet; 1.18.0 is the newest consumable version.
     implementation("androidx.core:core:1.18.0")
     implementation("androidx.fragment:fragment:1.8.9")
+    testImplementation("junit:junit:4.13.2")
 }
