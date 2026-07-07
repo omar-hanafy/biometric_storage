@@ -3,13 +3,14 @@ description: |
   Secure storage with optional biometric protection for Android, iOS, and macOS.
   Linux and Windows use unauthenticated OS-backed storage, and web stores plaintext
   data in localStorage and is not secure storage.
-version: 5.1.1-dev.2
+version: 5.1.1-dev.3
 homepage: https://github.com/omar-hanafy/biometric_storage
 repository: https://github.com/omar-hanafy/biometric_storage
 
 environment:
-  sdk: '>=3.11.4 <4.0.0'
-  flutter: ">=3.41.6"
+  # Flutter 3.44 / Dart 3.12 are required for Built-in Kotlin on Android.
+  sdk: '>=3.12.0 <4.0.0'
+  flutter: ">=3.44.0"
 
 dependencies:
   flutter:
@@ -21,7 +22,7 @@ dependencies:
   plugin_platform_interface: ^2.1.8
 
   ffi: ^2.2.0
-  win32: ^6.0.1
+  win32: ^6.3.0
   web: ^1.1.1
 
 dev_dependencies:

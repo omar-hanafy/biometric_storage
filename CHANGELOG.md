@@ -1,3 +1,27 @@
+## 5.1.1-dev.3
+
+* iOS/macOS: Rebuilt the Darwin keychain implementation on Apple's current LocalAuthentication guidance.
+  * Keychain prompts now use `LAContext.localizedReason` instead of the deprecated `kSecUseOperationPrompt`; custom `IosPromptInfo` messages keep working.
+  * Keychain operations run off the main thread, so the Flutter UI no longer blocks while a Face ID / Touch ID prompt is showing.
+  * `canAuthenticate` now reports biometry lockout as `errorHwUnavailable` instead of `unsupported`, and on macOS reports a disconnected Touch ID keyboard as `errorHwUnavailable` and missing paired biometry as `errorNoHardware`.
+  * Failed or unavailable authentication during keychain access now surfaces as an `AuthException` (`AuthError:AuthenticationFailed`, `AuthError:Canceled`) instead of a generic `SecurityError`.
+  * `darwinTouchIDAuthenticationAllowableReuseDuration` is clamped to the system maximum of 5 minutes.
+* iOS/macOS: Added privacy manifests (`PrivacyInfo.xcprivacy`) declaring no tracking and no data collection.
+* Android: Rebuilt the Kotlin implementation on Google's current BiometricPrompt guidance. Existing stored values, keys, and the wire protocol stay fully compatible.
+  * Updated `androidx.biometric` from `1.1.0` to `1.4.0-alpha05` (the newest version consumable with AGP 8.x / compileSdk 36) plus latest `androidx.core` and `androidx.fragment`.
+  * All keystore and file work now runs off the main thread, so the Flutter UI no longer blocks during storage access.
+  * Writes are atomic: a crash mid-write can no longer corrupt a previously stored value.
+  * Key generation falls back from StrongBox to the TEE when the device reports StrongBox as unavailable, instead of failing.
+  * Biometric prompts no longer target a destroyed activity after configuration changes (rotation, dark mode, etc.).
+  * Biometric lockout is now reported as `AuthError:LockedOut` instead of `AuthError:Unknown`.
+  * `canAuthenticate` no longer throws on unrecognized status codes, reports `errorPasscodeNotSet` when device credential fallback is requested but nothing is enrolled, and reports a pending security update as `errorHwUnavailable`.
+  * Storage names containing path separators are now rejected instead of writing outside the storage directory.
+  * Removed the `slf4j` and `kotlin-logging` dependencies; the plugin logs through `android.util.Log` (tag `BiometricStorage`, debug output opt-in via `adb shell setprop log.tag.BiometricStorage DEBUG`).
+  * `USE_FINGERPRINT` is now declared with `maxSdkVersion="27"` so it disappears from merged manifests on modern devices.
+* Android: Migrated to Flutter's Built-in Kotlin and the Kotlin DSL (`build.gradle.kts`); the plugin no longer applies the Kotlin Gradle Plugin.
+* Android: Raised the minimum supported Android version from API 23 to API 24, matching Flutter's supported floor.
+* Aligned the package with the Flutter `3.44` and Dart `3.12` release baseline (required for Built-in Kotlin).
+
 ## 5.1.1-dev.2
 
 * Improve `canAuthenticate` to include `InitOptions` to decide for which authentication type to check.
