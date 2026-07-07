@@ -95,7 +95,6 @@ class MyAppState extends State<MyApp> {
   void initState() {
     super.initState();
     logMessages.log.addListener(_logChanged);
-    // _checkAuthenticate();
   }
 
   @override
@@ -302,6 +301,7 @@ class StorageActions extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.spaceAround,
       children: <Widget>[
         ElevatedButton(
+          key: ValueKey('${storageFile.name}.read'),
           child: const Text('read'),
           onPressed: () async {
             _logger.fine('reading from ${storageFile.name}');
@@ -314,6 +314,7 @@ class StorageActions extends StatelessWidget {
           },
         ),
         ElevatedButton(
+          key: ValueKey('${storageFile.name}.write'),
           child: const Text('write'),
           onPressed: () async {
             _logger.fine('Going to write...');
@@ -328,6 +329,7 @@ class StorageActions extends StatelessWidget {
           },
         ),
         ElevatedButton(
+          key: ValueKey('${storageFile.name}.delete'),
           child: const Text('delete'),
           onPressed: () async {
             _logger.fine('deleting...');
