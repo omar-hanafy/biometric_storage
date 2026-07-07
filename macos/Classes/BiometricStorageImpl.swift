@@ -1,381 +1,444 @@
-// Shared file between iOS and Mac OS
-// make sure they stay in sync.
+// Shared implementation for iOS and macOS.
+// This file lives in macos/Classes and is symlinked into ios/Classes,
+// so both platforms always compile the exact same code.
+//
+// Keychain access follows Apple's current guidance:
+// https://developer.apple.com/documentation/localauthentication/accessing-keychain-items-with-face-id-or-touch-id
+// - Prompts are configured through LAContext.localizedReason instead of the
+//   deprecated kSecUseOperationPrompt.
+// - Items requiring authentication use SecAccessControl with
+//   kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly.
+// - Keychain calls run off the main thread because they can block on user
+//   interaction; results are always delivered back on the main thread.
 
 import Foundation
 import LocalAuthentication
+import Security
+import os.log
 
 typealias StorageCallback = (Any?) -> Void
 typealias StorageError = (String, String?, Any?) -> Any
+
+private let logger = OSLog(subsystem: "biometric_storage", category: "plugin")
 
 struct StorageMethodCall {
   let method: String
   let arguments: Any?
 }
 
-class InitOptions {
+/// Thin seam over the `SecItem*` API so the keychain can be faked in tests.
+protocol KeychainClient {
+  func copyMatching(_ query: [String: Any]) -> (status: OSStatus, item: AnyObject?)
+  func add(_ attributes: [String: Any]) -> OSStatus
+  func update(_ query: [String: Any], _ attributes: [String: Any]) -> OSStatus
+  func delete(_ query: [String: Any]) -> OSStatus
+}
+
+struct SystemKeychain: KeychainClient {
+  func copyMatching(_ query: [String: Any]) -> (status: OSStatus, item: AnyObject?) {
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    return (status, item)
+  }
+
+  func add(_ attributes: [String: Any]) -> OSStatus {
+    SecItemAdd(attributes as CFDictionary, nil)
+  }
+
+  func update(_ query: [String: Any], _ attributes: [String: Any]) -> OSStatus {
+    SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+  }
+
+  func delete(_ query: [String: Any]) -> OSStatus {
+    SecItemDelete(query as CFDictionary)
+  }
+}
+
+struct InitOptions {
   init(params: [String: Any]) {
-    darwinTouchIDAuthenticationAllowableReuseDuration = params["darwinTouchIDAuthenticationAllowableReuseDurationSeconds"] as? Int
-    darwinTouchIDAuthenticationForceReuseContextDuration = params["darwinTouchIDAuthenticationForceReuseContextDurationSeconds"] as? Int
+    darwinTouchIDAuthenticationAllowableReuseDuration =
+      params["darwinTouchIDAuthenticationAllowableReuseDurationSeconds"] as? Int
+    darwinTouchIDAuthenticationForceReuseContextDuration =
+      params["darwinTouchIDAuthenticationForceReuseContextDurationSeconds"] as? Int
     authenticationRequired = params["authenticationRequired"] as? Bool ?? true
     darwinBiometricOnly = params["darwinBiometricOnly"] as? Bool ?? true
   }
+
   let darwinTouchIDAuthenticationAllowableReuseDuration: Int?
   let darwinTouchIDAuthenticationForceReuseContextDuration: Int?
   let authenticationRequired: Bool
   let darwinBiometricOnly: Bool
 }
 
-class IOSPromptInfo {
+struct IOSPromptInfo {
   init(params: [String: Any]) {
     saveTitle = params["saveTitle"] as? String
     accessTitle = params["accessTitle"] as? String
   }
-  let saveTitle: String!
-  let accessTitle: String!
+
+  let saveTitle: String?
+  let accessTitle: String?
 }
 
-private func hpdebug(_ message: String) {
-  print(message);
+/// Shared dependencies handed to every storage file.
+struct StorageEnvironment {
+  let keychain: KeychainClient
+  let contextFactory: () -> LAContext
+  let accessControlFactory: (SecAccessControlCreateFlags) -> SecAccessControl?
+  let now: () -> Date
+  let workQueue: DispatchQueue
+  let storageError: StorageError
+}
+
+/// Results must reach Flutter on the main (platform) thread.
+private func completeOnMain(_ value: Any?, _ result: @escaping StorageCallback) {
+  DispatchQueue.main.async {
+    result(value)
+  }
+}
+
+private func defaultAccessControl(_ flags: SecAccessControlCreateFlags) -> SecAccessControl? {
+  var error: Unmanaged<CFError>?
+  guard let access = SecAccessControlCreateWithFlags(
+    nil,
+    kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+    flags,
+    &error
+  ) else {
+    os_log(.error, log: logger, "Unable to create access control: %{public}@",
+           String(describing: error?.takeRetainedValue()))
+    return nil
+  }
+  return access
 }
 
 class BiometricStorageImpl {
-  
-  init(storageError: @escaping StorageError, storageMethodNotImplemented: Any) {
+
+  init(
+    storageError: @escaping StorageError,
+    storageMethodNotImplemented: Any,
+    keychain: KeychainClient = SystemKeychain(),
+    contextFactory: @escaping () -> LAContext = { LAContext() },
+    accessControlFactory: ((SecAccessControlCreateFlags) -> SecAccessControl?)? = nil,
+    now: @escaping () -> Date = { Date() }
+  ) {
     self.storageError = storageError
     self.storageMethodNotImplemented = storageMethodNotImplemented
+    self.environment = StorageEnvironment(
+      keychain: keychain,
+      contextFactory: contextFactory,
+      accessControlFactory: accessControlFactory ?? defaultAccessControl(_:),
+      now: now,
+      workQueue: DispatchQueue(label: "biometric_storage.keychain", qos: .userInitiated),
+      storageError: storageError
+    )
   }
-  
-  private var stores: [String: BiometricStorageFile] = [:]
+
   private let storageError: StorageError
   private let storageMethodNotImplemented: Any
-
-  private func storageError(code: String, message: String?, details: Any?) -> Any {
-    return storageError(code, message, details)
-  }
+  private let environment: StorageEnvironment
+  private var stores: [String: BiometricStorageFile] = [:]
 
   public func handle(_ call: StorageMethodCall, result: @escaping StorageCallback) {
-    let args = call.arguments as? [String: Any]
+    let args = call.arguments as? [String: Any] ?? [:]
 
-    func requiredArg<T>(_ name: String, _ cb: (T) -> Void) {
-      guard let args else {
-        result(storageError(code: "InvalidArguments", message: "Invalid arguments \(String(describing: call.arguments))", details: nil))
-        return
-      }
+    func fail(_ code: String, _ message: String) {
+      completeOnMain(storageError(code, message, nil), result)
+    }
+
+    func requiredArg<T>(_ name: String) -> T? {
       guard let value = args[name] else {
-        result(storageError(code: "InvalidArguments", message: "Missing argument \(name)", details: nil))
-        return
+        fail("InvalidArguments", "Missing argument '\(name)' for method '\(call.method)'.")
+        return nil
       }
-      guard let valueTyped = value as? T else {
-        result(storageError(code: "InvalidArguments", message: "Invalid argument for \(name): expected \(T.self) got \(value)", details: nil))
-        return
+      guard let typed = value as? T else {
+        fail("InvalidArguments",
+             "Invalid argument for '\(name)': expected \(T.self), got \(type(of: value)).")
+        return nil
       }
-      cb(valueTyped)
-      return
+      return typed
     }
 
-    func optionalArg<T>(_ name: String) -> T? {
-      args?[name] as? T
-    }
-
-    func requireStorage(_ name: String, _ cb: (BiometricStorageFile) -> Void) {
+    func requiredStorage(_ name: String) -> BiometricStorageFile? {
       guard let file = stores[name] else {
-        result(storageError(code: "NoSuchStorage", message: "Storage \(name) was not initialized.", details: nil))
+        fail("NoSuchStorage", "Storage '\(name)' was not initialized.")
+        return nil
+      }
+      return file
+    }
+
+    switch call.method {
+    case "canAuthenticate":
+      guard let optionsParams: [String: Any] = requiredArg("options") else { return }
+      canAuthenticate(options: InitOptions(params: optionsParams), result: result)
+
+    case "init":
+      guard let name: String = requiredArg("name"),
+            let optionsParams: [String: Any] = requiredArg("options") else { return }
+      let forceInit = args["forceInit"] as? Bool ?? false
+      guard stores[name] == nil else {
+        if forceInit {
+          fail("AlreadyInitialized",
+               "A storage file with the name '\(name)' was already initialized.")
+        } else {
+          completeOnMain(false, result)
+        }
         return
       }
-      cb(file)
-    }
-    
-    if ("canAuthenticate" == call.method) {
-      requiredArg("options") { options in
-        let initOptions = InitOptions(params: options)
-        canAuthenticate(options: initOptions, result: result)
+      stores[name] = BiometricStorageFile(
+        name: name,
+        options: InitOptions(params: optionsParams),
+        environment: environment
+      )
+      completeOnMain(true, result)
+
+    case "dispose":
+      guard let name: String = requiredArg("name") else { return }
+      guard stores.removeValue(forKey: name) != nil else {
+        fail("NoSuchStorage", "Tried to dispose non-existing storage '\(name)'.")
+        return
       }
-    } else if ("init" == call.method) {
-      requiredArg("name") { (name: String) in
-        requiredArg("options") { (options: [String: Any]) in
-          let forceInit: Bool = optionalArg("forceInit") ?? false
-          if stores[name] != nil {
-            if forceInit {
-              result(storageError(
-                code: "AlreadyInitialized",
-                message: "A storage file with the name '\(name)' was already initialized.",
-                details: nil
-              ))
-            } else {
-              result(false)
-            }
-            return
-          }
-          stores[name] = BiometricStorageFile(
-            name: name,
-            initOptions: InitOptions(params: options),
-            storageError: storageError
-          )
-          result(true)
-        }
-      }
-    } else if ("dispose" == call.method) {
-      requiredArg("name") { (name: String) in
-        guard stores.removeValue(forKey: name) != nil else {
-          result(storageError(code: "NoSuchStorage", message: "Tried to dispose non existing storage.", details: nil))
-          return
-        }
-        result(true)
-      }
-    } else if ("read" == call.method) {
-      requiredArg("name") { name in
-        requiredArg("iosPromptInfo") { promptInfo in
-          requireStorage(name) { file in
-            file.read(result, IOSPromptInfo(params: promptInfo))
-          }
-        }
-      }
-    } else if ("write" == call.method) {
-      requiredArg("name") { name in
-        requiredArg("content") { content in
-          requiredArg("iosPromptInfo") { promptInfo in
-            requireStorage(name) { file in
-              file.write(content, result, IOSPromptInfo(params: promptInfo))
-            }
-          }
-        }
-      }
-    } else if ("delete" == call.method) {
-      requiredArg("name") { name in
-        requiredArg("iosPromptInfo") { promptInfo in
-          requireStorage(name) { file in
-            file.delete(result, IOSPromptInfo(params: promptInfo))
-          }
-        }
-      }
-    } else {
-      result(storageMethodNotImplemented)
+      completeOnMain(true, result)
+
+    case "read":
+      guard let name: String = requiredArg("name"),
+            let promptParams: [String: Any] = requiredArg("iosPromptInfo"),
+            let file = requiredStorage(name) else { return }
+      file.read(IOSPromptInfo(params: promptParams), result)
+
+    case "write":
+      guard let name: String = requiredArg("name"),
+            let content: String = requiredArg("content"),
+            let promptParams: [String: Any] = requiredArg("iosPromptInfo"),
+            let file = requiredStorage(name) else { return }
+      file.write(content, IOSPromptInfo(params: promptParams), result)
+
+    case "delete":
+      guard let name: String = requiredArg("name"),
+            let _: [String: Any] = requiredArg("iosPromptInfo"),
+            let file = requiredStorage(name) else { return }
+      file.delete(result)
+
+    default:
+      completeOnMain(storageMethodNotImplemented, result)
     }
   }
-  
 
   private func canAuthenticate(options: InitOptions, result: @escaping StorageCallback) {
+    let policy: LAPolicy = options.darwinBiometricOnly
+      ? .deviceOwnerAuthenticationWithBiometrics
+      : .deviceOwnerAuthentication
+    let context = environment.contextFactory()
     var error: NSError?
-    let context = LAContext()
-    let policy: LAPolicy = options.darwinBiometricOnly ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
     if context.canEvaluatePolicy(policy, error: &error) {
-      result("Success")
+      completeOnMain("Success", result)
       return
     }
-    guard let err = error else {
-      result("ErrorUnknown")
+    guard let error else {
+      completeOnMain("ErrorUnknown", result)
       return
     }
-    let laError = LAError(_nsError: err)
-    NSLog("LAError: \(laError)");
-    switch laError.code {
-    case .biometryNotAvailable, .touchIDNotAvailable:
-      result("ErrorHwUnavailable")
-      break;
+    os_log(.info, log: logger, "canEvaluatePolicy failed: %{public}@", error)
+    completeOnMain(Self.canAuthenticateCode(for: error), result)
+  }
+
+  private static func canAuthenticateCode(for error: NSError) -> String {
+    guard error.domain == LAErrorDomain else {
+      return "ErrorUnknown"
+    }
+    #if os(macOS)
+    if #available(macOS 11.2, *) {
+      // A Mac can lack paired biometry (no built-in or paired Touch ID) or
+      // temporarily lose it (Magic Keyboard disconnected).
+      if error.code == LAError.biometryNotPaired.rawValue {
+        return "ErrorNoHardware"
+      }
+      if error.code == LAError.biometryDisconnected.rawValue {
+        return "ErrorHwUnavailable"
+      }
+    }
+    #endif
+    switch LAError(_nsError: error).code {
+    case .biometryNotAvailable:
+      return "ErrorHwUnavailable"
+    case .biometryLockout:
+      // Biometry is enrolled but temporarily locked after too many failed
+      // attempts; it becomes available again after passcode authentication.
+      return "ErrorHwUnavailable"
+    case .biometryNotEnrolled:
+      return "ErrorNoBiometricEnrolled"
     case .passcodeNotSet:
-      result("ErrorPasscodeNotSet")
-      break;
-    case .biometryNotEnrolled, .touchIDNotEnrolled:
-      result("ErrorNoBiometricEnrolled")
-      break;
-    case .invalidContext: fallthrough
+      return "ErrorPasscodeNotSet"
     default:
-      result("ErrorUnknown")
-      break;
+      return "ErrorUnknown"
     }
   }
 }
 
-typealias StoredContext = (context: LAContext, expireAt: Date)
-
 class BiometricStorageFile {
-  private let name: String
-  private let initOptions: InitOptions
-  private var _context: StoredContext?
-  private var context: LAContext {
-    get {
-      if let context = _context {
-        if context.expireAt.timeIntervalSinceNow < 0 {
-          // already expired.
-          _context = nil
-        } else {
-          return context.context
-        }
-      }
-      
-      let context = LAContext()
-      if (initOptions.authenticationRequired) {
-        if let duration = initOptions.darwinTouchIDAuthenticationAllowableReuseDuration {
-          if #available(OSX 10.12, *) {
-            context.touchIDAuthenticationAllowableReuseDuration = Double(duration)
-          } else {
-            // Fallback on earlier versions
-            hpdebug("Pre OSX 10.12 no touchIDAuthenticationAllowableReuseDuration available. ignoring.")
-          }
-        }
-        
-        if let duration = initOptions.darwinTouchIDAuthenticationForceReuseContextDuration {
-          _context = (context: context, expireAt: Date(timeIntervalSinceNow: Double(duration)))
-        }
-      }
-      return context
-    }
-  }
-  private let storageError: StorageError
 
-  init(name: String, initOptions: InitOptions, storageError: @escaping StorageError) {
+  init(name: String, options: InitOptions, environment: StorageEnvironment) {
     self.name = name
-    self.initOptions = initOptions
-    self.storageError = storageError
+    self.options = options
+    self.env = environment
   }
-  
-  private func baseQuery(_ result: @escaping StorageCallback) -> [String: Any]? {
-    var query = [
+
+  private let name: String
+  private let options: InitOptions
+  private let env: StorageEnvironment
+  /// Only accessed on `env.workQueue`.
+  private var cachedContext: (context: LAContext, expiresAt: Date)?
+
+  /// Base attributes identifying this store's keychain item. Search queries
+  /// deliberately never contain `kSecAttrAccessControl`; access control is an
+  /// item creation attribute, not a match criterion.
+  private var baseQuery: [String: Any] {
+    var query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: "flutter_biometric_storage",
       kSecAttrAccount as String: name,
-    ] as [String : Any]
-    if initOptions.authenticationRequired {
-      guard let access = accessControl(result) else {
-        return nil
-      }
-      if #available(iOS 13.0, macOS 10.15, *) {
-        query[kSecUseDataProtectionKeychain as String] = true
-      }
-      query[kSecAttrAccessControl as String] = access
+    ]
+    if options.authenticationRequired {
+      query[kSecUseDataProtectionKeychain as String] = true
     }
     return query
   }
-  
-  private func accessControl(_ result: @escaping StorageCallback) -> SecAccessControl? {
-    let accessControlFlags: SecAccessControlCreateFlags
-    
-    if initOptions.darwinBiometricOnly {
-      if #available(iOS 11.3, *) {
-        accessControlFlags =  .biometryCurrentSet
-      } else {
-        accessControlFlags = .touchIDCurrentSet
-      }
+
+  /// Returns the LAContext for an operation, honoring the configured reuse
+  /// durations. Must be called on `env.workQueue`.
+  private func authContext(reason: String?) -> LAContext {
+    let context: LAContext
+    if let cached = cachedContext, cached.expiresAt > env.now() {
+      context = cached.context
     } else {
-      accessControlFlags = .userPresence
+      cachedContext = nil
+      context = env.contextFactory()
+      if let seconds = options.darwinTouchIDAuthenticationAllowableReuseDuration {
+        context.touchIDAuthenticationAllowableReuseDuration = min(
+          Double(seconds), LATouchIDAuthenticationMaximumAllowableReuseDuration)
+      }
+      if let seconds = options.darwinTouchIDAuthenticationForceReuseContextDuration {
+        cachedContext = (
+          context: context,
+          expiresAt: env.now().addingTimeInterval(Double(seconds))
+        )
+      }
     }
-        
-//      access = SecAccessControlCreateWithFlags(nil,
-//                                               kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-//                                               accessControlFlags,
-//                                               &error)
-    var error: Unmanaged<CFError>?
-    guard let access = SecAccessControlCreateWithFlags(
-      nil, // Use the default allocator.
-      kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
-      accessControlFlags,
-      &error) else {
-      hpdebug("Error while creating access control flags. \(String(describing: error))")
-      result(storageError("writing data", "error writing data", "\(String(describing: error))"));
-      return nil
+    // The keychain prompt shows LAContext.localizedReason; this replaces the
+    // deprecated kSecUseOperationPrompt query attribute.
+    if let reason, !reason.isEmpty {
+      context.localizedReason = reason
     }
-
-    return access
+    return context
   }
-  
-  func read(_ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
 
-    guard var query = baseQuery(result) else {
-      return;
-    }
-    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    query[kSecUseOperationPrompt as String] = promptInfo.accessTitle
-    query[kSecReturnAttributes as String] = true
-    query[kSecReturnData as String] = true
-    query[kSecUseAuthenticationContext as String] = context
-    
-    var item: CFTypeRef?
-    
-    let status = SecItemCopyMatching(query as CFDictionary, &item)
-    guard status != errSecItemNotFound else {
-      result(nil)
-      return
-    }
-    guard status == errSecSuccess else {
-      handleOSStatusError(status, result, "Error retrieving item. \(status)")
-      return
-    }
-    guard let existingItem = item as? [String : Any],
-      let data = existingItem[kSecValueData as String] as? Data,
-      let dataString = String(data: data, encoding: String.Encoding.utf8)
-      else {
-        result(storageError("RetrieveError", "Unexpected data.", nil))
+  func read(_ promptInfo: IOSPromptInfo, _ result: @escaping StorageCallback) {
+    env.workQueue.async { [self] in
+      var query = baseQuery
+      query[kSecMatchLimit as String] = kSecMatchLimitOne
+      query[kSecReturnData as String] = true
+      if options.authenticationRequired {
+        query[kSecUseAuthenticationContext as String] =
+          authContext(reason: promptInfo.accessTitle)
+      }
+      let (status, item) = env.keychain.copyMatching(query)
+      guard status != errSecItemNotFound else {
+        completeOnMain(nil, result)
         return
-    }
-    result(dataString)
-  }
-  
-  func delete(_ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
-    guard let query = baseQuery(result) else {
-      return;
-    }
-    //    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    //    query[kSecReturnData as String] = true
-    let status = SecItemDelete(query as CFDictionary)
-    if status == errSecSuccess {
-      result(true)
-      return
-    }
-    if status == errSecItemNotFound {
-      hpdebug("Item not in keychain. Nothing to delete.")
-      result(true)
-      return
-    }
-    handleOSStatusError(status, result, "writing data")
-  }
-  
-  func write(_ content: String, _ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
-    guard var query = baseQuery(result) else {
-      return;
-    }
-
-    if (initOptions.authenticationRequired) {
-      query.merge([
-        kSecUseAuthenticationContext as String: context,
-      ]) { (_, new) in new }
-      if let operationPrompt = promptInfo.saveTitle {
-        query[kSecUseOperationPrompt as String] = operationPrompt
       }
-    } else {
-      hpdebug("No authentication required for \(name)")
+      guard status == errSecSuccess else {
+        completeError(status, while: "reading data", result)
+        return
+      }
+      guard let data = item as? Data,
+            let content = String(data: data, encoding: .utf8) else {
+        completeOnMain(
+          env.storageError("RetrieveError", "Unexpected data in keychain item.", nil),
+          result)
+        return
+      }
+      completeOnMain(content, result)
     }
-    query.merge([
-      //      kSecMatchLimit as String: kSecMatchLimitOne,
-      kSecValueData as String: content.data(using: String.Encoding.utf8) as Any,
-    ]) { (_, new) in new }
-    var status = SecItemAdd(query as CFDictionary, nil)
-    if (status == errSecDuplicateItem) {
-      hpdebug("Value already exists. updating.")
-      let update = [kSecValueData as String: query[kSecValueData as String]]
-      query.removeValue(forKey: kSecValueData as String)
-      status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-    }
-    guard status == errSecSuccess else {
-      handleOSStatusError(status, result, "writing data")
-      return
-    }
-    result(nil)
   }
-  
-  private func handleOSStatusError(_ status: OSStatus, _ result: @escaping StorageCallback, _ message: String) {
-    var errorMessage: String? = nil
-    if #available(iOS 11.3, OSX 10.12, *) {
-      errorMessage = SecCopyErrorMessageString(status, nil) as String?
+
+  func write(_ content: String, _ promptInfo: IOSPromptInfo, _ result: @escaping StorageCallback) {
+    env.workQueue.async { [self] in
+      guard let value = content.data(using: .utf8) else {
+        completeOnMain(
+          env.storageError("WriteError", "Unable to encode content to UTF-8.", nil),
+          result)
+        return
+      }
+
+      var context: LAContext?
+      var attributes = baseQuery
+      if options.authenticationRequired {
+        let flags: SecAccessControlCreateFlags =
+          options.darwinBiometricOnly ? .biometryCurrentSet : .userPresence
+        guard let accessControl = env.accessControlFactory(flags) else {
+          completeOnMain(
+            env.storageError(
+              "SecurityError", "Unable to create access control for '\(name)'.", nil),
+            result)
+          return
+        }
+        attributes[kSecAttrAccessControl as String] = accessControl
+        let operationContext = authContext(reason: promptInfo.saveTitle)
+        attributes[kSecUseAuthenticationContext as String] = operationContext
+        context = operationContext
+      } else {
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+      }
+      attributes[kSecValueData as String] = value
+
+      var status = env.keychain.add(attributes)
+      if status == errSecDuplicateItem {
+        // Updating (instead of delete + add) keeps the existing item's access
+        // control and forces user authentication for protected items.
+        var query = baseQuery
+        if let context {
+          query[kSecUseAuthenticationContext as String] = context
+        }
+        status = env.keychain.update(query, [kSecValueData as String: value])
+      }
+      guard status == errSecSuccess else {
+        completeError(status, while: "writing data", result)
+        return
+      }
+      completeOnMain(nil, result)
     }
+  }
+
+  func delete(_ result: @escaping StorageCallback) {
+    env.workQueue.async { [self] in
+      let status = env.keychain.delete(baseQuery)
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        completeError(status, while: "deleting data", result)
+        return
+      }
+      completeOnMain(true, result)
+    }
+  }
+
+  private func completeError(
+    _ status: OSStatus, while action: String, _ result: @escaping StorageCallback
+  ) {
+    let description = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
     let code: String
     switch status {
     case errSecUserCanceled:
       code = "AuthError:UserCanceled"
+    case errSecAuthFailed:
+      code = "AuthError:AuthenticationFailed"
+    case errSecInteractionNotAllowed:
+      code = "AuthError:Canceled"
     default:
       code = "SecurityError"
     }
-    
-    result(storageError(code, "Error while \(message): \(status): \(errorMessage ?? "Unknown")", nil))
+    os_log(.error, log: logger, "Error while %{public}@: %d %{public}@",
+           action, status, description)
+    completeOnMain(
+      env.storageError(code, "Error while \(action): \(status): \(description)", nil),
+      result)
   }
-  
 }

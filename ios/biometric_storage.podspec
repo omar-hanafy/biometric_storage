@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'biometric_storage'
-  s.version          = '5.1.1-dev.2'
+  s.version          = '5.1.1-dev.3'
   s.summary          = 'Secure storage with optional biometric protection for Flutter.'
   s.description      = <<-DESC
 Secure storage with optional biometric protection for Flutter apps.
@@ -15,8 +15,10 @@ Secure storage with optional biometric protection for Flutter apps.
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.public_header_files = 'Classes/**/*.h'
+  s.resource_bundles = { 'biometric_storage_privacy' => ['Resources/PrivacyInfo.xcprivacy'] }
   s.dependency 'Flutter'
   s.platform = :ios, '13.0'
+  s.frameworks = 'LocalAuthentication', 'Security'
 
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
