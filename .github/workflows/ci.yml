@@ -109,6 +109,9 @@ jobs:
       - name: Install pana
         run: dart pub global activate pana
 
+      - name: Install webp tools (pana screenshot checks need them)
+        run: sudo apt-get update && sudo apt-get install -y webp
+
       - name: Run pana (full score required)
         run: |
           set -euo pipefail
