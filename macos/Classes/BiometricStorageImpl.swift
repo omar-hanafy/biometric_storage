@@ -264,7 +264,7 @@ class BiometricStorageImpl {
     case .biometryLockout:
       // Biometry is enrolled but temporarily locked after too many failed
       // attempts; it becomes available again after passcode authentication.
-      return "ErrorHwUnavailable"
+      return "ErrorLockedOut"
     case .biometryNotEnrolled:
       return "ErrorNoBiometricEnrolled"
     case .passcodeNotSet:
@@ -429,7 +429,11 @@ class BiometricStorageFile {
     case errSecUserCanceled:
       code = "AuthError:UserCanceled"
     case errSecAuthFailed:
-      code = "AuthError:AuthenticationFailed"
+      // The keychain reports errSecAuthFailed for a failed biometric match
+      // and for biometry lockout alike; a post-flight probe tells them apart.
+      code = isBiometryLockedOut()
+        ? "AuthError:LockedOut"
+        : "AuthError:AuthenticationFailed"
     case errSecInteractionNotAllowed:
       code = "AuthError:Canceled"
     default:
@@ -440,5 +444,26 @@ class BiometricStorageFile {
     completeOnMain(
       env.storageError(code, "Error while \(action): \(status): \(description)", nil),
       result)
+  }
+
+  /// Disambiguates `errSecAuthFailed` after a keychain operation on an
+  /// auth-required store. A fresh probe context (never the operation context,
+  /// whose state the failed operation may have poisoned) asks
+  /// LocalAuthentication whether biometry is currently locked out. The result
+  /// is intentionally not cached because lockout ends with the next passcode
+  /// authentication. Must be called on `env.workQueue`.
+  private func isBiometryLockedOut() -> Bool {
+    guard options.authenticationRequired else {
+      return false
+    }
+    let probe = env.contextFactory()
+    var error: NSError?
+    if probe.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
+      return false
+    }
+    guard let error, error.domain == LAErrorDomain else {
+      return false
+    }
+    return LAError(_nsError: error).code == .biometryLockout
   }
 }

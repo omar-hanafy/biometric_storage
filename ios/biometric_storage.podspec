@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'biometric_storage'
-  s.version          = '5.1.1-dev.3'
+  s.version          = '6.0.0'
   s.summary          = 'Secure storage with optional biometric protection for Flutter.'
   s.description      = <<-DESC
 Secure storage with optional biometric protection for Flutter apps.

@@ -118,6 +118,7 @@ final class RunnerTests: XCTestCase {
   private var keychain = FakeKeychain()
   private var contexts: [FakeLAContext] = []
   private var contextFactoryCallCount = 0
+  private var contextFactoryThreadWasMain: [Bool] = []
   private var recordedAccessControlFlags: [SecAccessControlCreateFlags] = []
   private var currentDate = Date(timeIntervalSince1970: 1_000_000)
 
@@ -126,6 +127,7 @@ final class RunnerTests: XCTestCase {
     keychain = FakeKeychain()
     contexts = []
     contextFactoryCallCount = 0
+    contextFactoryThreadWasMain = []
     recordedAccessControlFlags = []
     currentDate = Date(timeIntervalSince1970: 1_000_000)
   }
@@ -143,6 +145,7 @@ final class RunnerTests: XCTestCase {
       keychain: keychainOverride ?? keychain,
       contextFactory: { [self] in
         contextFactoryCallCount += 1
+        contextFactoryThreadWasMain.append(Thread.isMainThread)
         let context = nextContext?() ?? FakeLAContext()
         contexts.append(context)
         return context
@@ -330,10 +333,10 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(value as? String, "ErrorHwUnavailable")
   }
 
-  func testCanAuthenticateMapsBiometryLockoutToHwUnavailable() {
+  func testCanAuthenticateMapsBiometryLockoutToLockedOut() {
     let (value, _) = canAuthenticateResult(
       canEvaluate: false, errorCode: LAError.biometryLockout.rawValue)
-    XCTAssertEqual(value as? String, "ErrorHwUnavailable")
+    XCTAssertEqual(value as? String, "ErrorLockedOut")
   }
 
   func testCanAuthenticateMapsUnknownFailureToErrorUnknown() {
@@ -534,6 +537,88 @@ final class RunnerTests: XCTestCase {
     let value = invoke(impl, "write", promptArgs(extra: ["content": "x"]))
     assertError(value, code: "SecurityError")
     XCTAssertTrue(keychain.addedAttributes.isEmpty)
+  }
+
+  // MARK: errSecAuthFailed lockout attribution
+
+  /// Context whose canEvaluatePolicy fails with the given LAError code, as
+  /// handed to the post-flight lockout probe.
+  private func evaluationFailingContext(_ errorCode: Int) -> FakeLAContext {
+    let context = FakeLAContext()
+    context.canEvaluateResult = false
+    context.canEvaluateError = laError(errorCode)
+    return context
+  }
+
+  /// makeImpl variant whose context factory hands out `sequence` in order,
+  /// then falls back to fresh default contexts.
+  private func makeImpl(handingOut sequence: [FakeLAContext]) -> BiometricStorageImpl {
+    var pending = sequence
+    return makeImpl(nextContext: {
+      pending.isEmpty ? FakeLAContext() : pending.removeFirst()
+    })
+  }
+
+  func testReadAuthFailedWhileLockedOutMapsToAuthErrorLockedOut() {
+    let probe = evaluationFailingContext(LAError.biometryLockout.rawValue)
+    let impl = makeImpl(handingOut: [FakeLAContext(), probe])
+    initStore(impl)
+    keychain.copyMatchingResult = (errSecAuthFailed, nil)
+
+    assertError(invoke(impl, "read", promptArgs()), code: "AuthError:LockedOut")
+
+    XCTAssertEqual(contextFactoryCallCount, 2, "operation context plus one probe context")
+    XCTAssertEqual(probe.evaluatedPolicies, [.deviceOwnerAuthenticationWithBiometrics])
+    XCTAssertEqual(contextFactoryThreadWasMain, [false, false],
+                   "the lockout probe must run on the work queue, never the main thread")
+  }
+
+  func testWriteAuthFailedWhileLockedOutMapsToAuthErrorLockedOut() {
+    let probe = evaluationFailingContext(LAError.biometryLockout.rawValue)
+    let impl = makeImpl(handingOut: [FakeLAContext(), probe])
+    initStore(impl)
+    keychain.addResult = errSecAuthFailed
+
+    assertError(invoke(impl, "write", promptArgs(extra: ["content": "x"])),
+                code: "AuthError:LockedOut")
+
+    XCTAssertEqual(contextFactoryCallCount, 2, "operation context plus one probe context")
+    XCTAssertEqual(probe.evaluatedPolicies, [.deviceOwnerAuthenticationWithBiometrics])
+  }
+
+  func testReadAuthFailedWithNonLockoutProbeStaysAuthenticationFailed() {
+    let probe = evaluationFailingContext(LAError.biometryNotAvailable.rawValue)
+    let impl = makeImpl(handingOut: [FakeLAContext(), probe])
+    initStore(impl)
+    keychain.copyMatchingResult = (errSecAuthFailed, nil)
+
+    assertError(invoke(impl, "read", promptArgs()), code: "AuthError:AuthenticationFailed")
+
+    XCTAssertEqual(probe.evaluatedPolicies, [.deviceOwnerAuthenticationWithBiometrics])
+  }
+
+  func testAuthFailedOnUnauthenticatedStoreDoesNotProbeLockout() {
+    let impl = makeImpl()
+    initStore(impl, options: ["authenticationRequired": false])
+    keychain.copyMatchingResult = (errSecAuthFailed, nil)
+
+    assertError(invoke(impl, "read", promptArgs()), code: "AuthError:AuthenticationFailed")
+
+    XCTAssertEqual(contextFactoryCallCount, 0,
+                   "unauthenticated stores must never trigger a lockout probe")
+  }
+
+  func testLockoutProbeResultIsNotCachedAcrossOperations() {
+    let lockedOutProbe = evaluationFailingContext(LAError.biometryLockout.rawValue)
+    let impl = makeImpl(
+      handingOut: [FakeLAContext(), lockedOutProbe, FakeLAContext(), FakeLAContext()])
+    initStore(impl)
+    keychain.copyMatchingResult = (errSecAuthFailed, nil)
+
+    assertError(invoke(impl, "read", promptArgs()), code: "AuthError:LockedOut")
+    assertError(invoke(impl, "read", promptArgs()), code: "AuthError:AuthenticationFailed")
+
+    XCTAssertEqual(contextFactoryCallCount, 4, "every errSecAuthFailed must probe afresh")
   }
 
   // MARK: delete
