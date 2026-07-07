@@ -21,7 +21,7 @@ jobs:
       - name: Setup Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.41.6'
+          flutter-version: '3.44.4'
           channel: stable
           cache: true
 
@@ -99,7 +99,7 @@ jobs:
       - name: Setup Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.41.6'
+          flutter-version: '3.44.4'
           channel: stable
           cache: true
 
@@ -136,7 +136,7 @@ jobs:
         include:
           - name: android
             os: ubuntu-latest
-            command: flutter build appbundle
+            command: flutter build appbundle && cd android && ./gradlew :biometric_storage:testDebugUnitTest
             java: true
           - name: ios
             os: macos-latest
@@ -160,7 +160,7 @@ jobs:
       - name: Setup Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.41.6'
+          flutter-version: '3.44.4'
           channel: stable
           cache: true
 
