@@ -13,8 +13,8 @@ Secure storage with optional biometric protection for Flutter apps.
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'omar-hanafy' => 'omar_hanafy@icloud.com' }
   s.source           = { :path => '.' }
-  s.source_files     = 'Classes/**/*'
-  s.resource_bundles = { 'biometric_storage_privacy' => ['Resources/PrivacyInfo.xcprivacy'] }
+  s.source_files     = 'biometric_storage/Sources/biometric_storage/**/*.swift'
+  s.resource_bundles = { 'biometric_storage_privacy' => ['biometric_storage/Sources/biometric_storage/PrivacyInfo.xcprivacy'] }
   s.dependency 'FlutterMacOS'
 
   s.platform = :osx, '10.15'

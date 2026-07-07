@@ -1,8 +1,7 @@
 name: biometric_storage
-description: |
-  Secure storage with optional biometric protection for Android, iOS, and macOS.
-  Linux and Windows use unauthenticated OS-backed storage, and web stores plaintext
-  data in localStorage and is not secure storage.
+description: >-
+  Secure storage with optional biometric protection for Android, iOS, and
+  macOS. Linux, Windows, and web fall back to unauthenticated storage.
 version: 6.0.0
 homepage: https://github.com/omar-hanafy/biometric_storage
 repository: https://github.com/omar-hanafy/biometric_storage

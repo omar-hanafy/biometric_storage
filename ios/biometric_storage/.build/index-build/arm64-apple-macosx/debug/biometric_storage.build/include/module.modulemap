@@ -1,0 +1,3 @@
+module biometric_storage {
+    header "/Users/omarhanafy/Development/MyProjects/biometric_storage/ios/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/include/biometric_storage-Swift.h"
+}

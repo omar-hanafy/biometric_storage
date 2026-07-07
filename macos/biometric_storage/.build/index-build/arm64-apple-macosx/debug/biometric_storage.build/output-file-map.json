@@ -1,0 +1,26 @@
+{
+  "": {
+    "swift-dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/primary.swiftdeps"
+  },
+  "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/Sources/biometric_storage/BiometricStorageImpl.swift": {
+    "dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageImpl.d",
+    "object": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageImpl.swift.o",
+    "swiftmodule": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageImpl~partial.swiftmodule",
+    "swift-dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageImpl.swiftdeps",
+    "diagnostics": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageImpl.dia"
+  },
+  "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/Sources/biometric_storage/BiometricStorageMacOSPlugin.swift": {
+    "dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageMacOSPlugin.d",
+    "object": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageMacOSPlugin.swift.o",
+    "swiftmodule": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageMacOSPlugin~partial.swiftmodule",
+    "swift-dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageMacOSPlugin.swiftdeps",
+    "diagnostics": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/BiometricStorageMacOSPlugin.dia"
+  },
+  "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/DerivedSources/resource_bundle_accessor.swift": {
+    "dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/resource_bundle_accessor.d",
+    "object": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/resource_bundle_accessor.swift.o",
+    "swiftmodule": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/resource_bundle_accessor~partial.swiftmodule",
+    "swift-dependencies": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/resource_bundle_accessor.swiftdeps",
+    "diagnostics": "/Users/omarhanafy/Development/MyProjects/biometric_storage/macos/biometric_storage/.build/index-build/arm64-apple-macosx/debug/biometric_storage.build/resource_bundle_accessor.dia"
+  }
+}

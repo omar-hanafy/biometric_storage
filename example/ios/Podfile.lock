@@ -1,20 +1,14 @@
 PODS:
-  - biometric_storage (6.0.0):
-    - Flutter
   - Flutter (1.0.0)
 
 DEPENDENCIES:
-  - biometric_storage (from `.symlinks/plugins/biometric_storage/ios`)
   - Flutter (from `Flutter`)
 
 EXTERNAL SOURCES:
-  biometric_storage:
-    :path: ".symlinks/plugins/biometric_storage/ios"
   Flutter:
     :path: Flutter
 
 SPEC CHECKSUMS:
-  biometric_storage: 9d664a64dee781466f72f909c14d1fd31d059df5
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
 
 PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e

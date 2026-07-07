@@ -40,6 +40,7 @@ Rebuilt the Darwin keychain implementation on Apple's current LocalAuthenticatio
 * On macOS, a disconnected Touch ID keyboard reports `errorHwUnavailable` and missing paired biometry reports `errorNoHardware` instead of `unsupported`.
 * `darwinTouchIDAuthenticationAllowableReuseDuration` is clamped to the system maximum of 5 minutes.
 * Added privacy manifests (`PrivacyInfo.xcprivacy`) declaring no tracking and no data collection.
+* Added Swift Package Manager support alongside CocoaPods, following Flutter's official plugin layout.
 
 ## 5.1.1-dev.2
 
