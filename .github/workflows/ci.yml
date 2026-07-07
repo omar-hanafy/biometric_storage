@@ -124,6 +124,7 @@ jobs:
               for s in sections:
                   if s.get('grantedPoints', 0) < s.get('maxPoints', 0):
                       print(f\"  - {s.get('title', '?')}: {s.get('grantedPoints', 0)}/{s.get('maxPoints', 0)}\")
+                      print(s.get('summary', ''))
               sys.exit(1)
           "
 
