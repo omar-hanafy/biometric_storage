@@ -1,31 +1,75 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:logging/logging.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
-final _logger = Logger('biometric_storage');
-
-/// Reason for not supporting authentication.
-/// **As long as this is NOT [unsupported] you can still use the secure
-/// storage without biometric storage** (By setting
-/// [StorageFileInitOptions.authenticationRequired] to `false`).
+/// The device's ability to authenticate the user, as reported by
+/// [BiometricStorage.canAuthenticate].
+///
+/// As long as the response is not [unsupported] the secure storage itself is
+/// usable; set [StorageFileInitOptions.authenticationRequired] to `false` to
+/// store values without any authentication gate.
 enum CanAuthenticateResponse {
+  /// The user can authenticate right now with the requested authenticators.
   success,
+
+  /// Biometric hardware exists but is currently unavailable.
+  ///
+  /// Examples: the sensor is busy or temporarily disabled, or on macOS the
+  /// Touch ID equipped keyboard is disconnected. Trying again later may
+  /// succeed.
   errorHwUnavailable,
+
+  /// Biometric hardware is available but the user has not enrolled any
+  /// biometry (no fingerprint, face, or iris registered).
+  ///
+  /// Direct the user to system settings to enroll, or fall back to
+  /// non-biometric storage ([StorageFileInitOptions.authenticationRequired]
+  /// set to `false`).
   errorNoBiometricEnrolled,
+
+  /// The device has no biometric hardware, or on macOS no built-in or paired
+  /// Touch ID is present.
   errorNoHardware,
 
-  /// Passcode is not set (iOS/MacOS) or no user credentials (on macos).
+  /// Authentication requires a device credential, but no passcode, PIN,
+  /// pattern, or password is set up on the device.
+  ///
+  /// Reported on iOS and macOS when the passcode is disabled, and on Android
+  /// when device-credential fallback was requested
+  /// ([StorageFileInitOptions.androidBiometricOnly] set to `false`) while
+  /// neither biometrics nor a credential are enrolled.
   errorPasscodeNotSet,
 
-  /// Used on android if the status is unknown.
-  /// https://developer.android.com/reference/androidx/biometric/BiometricManager#BIOMETRIC_STATUS_UNKNOWN
+  /// Biometry is enrolled but locked after too many failed attempts.
+  ///
+  /// Reported on iOS and macOS. The lock clears after the user successfully
+  /// authenticates with the device passcode (for example by locking and
+  /// unlocking the device, or through any passcode-allowing prompt).
+  /// Android cannot report lockout from a capability check; there it only
+  /// surfaces when an actual prompt fails with
+  /// [AuthExceptionCode.lockedOut] or
+  /// [AuthExceptionCode.lockedOutPermanently].
+  errorLockedOut,
+
+  /// The biometric sensor is unusable until the device installs a security
+  /// update. Reported on Android only.
+  errorSecurityUpdateRequired,
+
+  /// Android could not determine the biometric status; authentication may
+  /// still succeed when actually attempted.
+  ///
+  /// See BIOMETRIC_STATUS_UNKNOWN in the androidx BiometricManager
+  /// documentation. Treat it as "try and handle failure" rather than as an
+  /// error.
   statusUnknown,
 
-  /// Plugin does not support platform. This should no longer be the case.
+  /// This platform or embedder cannot authenticate at all.
+  ///
+  /// Returned on Windows, on the web, and for unknown platforms. The storage
+  /// backends on those platforms are NOT protected by user authentication;
+  /// see the package README for what each platform provides instead.
   unsupported,
 }
 
@@ -35,137 +79,319 @@ const _canAuthenticateMapping = {
   'ErrorNoBiometricEnrolled': CanAuthenticateResponse.errorNoBiometricEnrolled,
   'ErrorNoHardware': CanAuthenticateResponse.errorNoHardware,
   'ErrorPasscodeNotSet': CanAuthenticateResponse.errorPasscodeNotSet,
-  'ErrorUnknown': CanAuthenticateResponse.unsupported,
+  'ErrorLockedOut': CanAuthenticateResponse.errorLockedOut,
+  'ErrorSecurityUpdateRequired':
+      CanAuthenticateResponse.errorSecurityUpdateRequired,
   'ErrorStatusUnknown': CanAuthenticateResponse.statusUnknown,
+  'ErrorUnknown': CanAuthenticateResponse.unsupported,
 };
 
+/// The reason an authentication-gated operation failed, carried by
+/// [AuthException.code].
+///
+/// Every value the native platforms can produce has a dedicated code, so an
+/// exhaustive `switch` over this enum handles all authentication outcomes.
 enum AuthExceptionCode {
-  /// User taps the cancel/negative button or presses `back`.
+  /// The user dismissed the prompt on purpose, for example by tapping the
+  /// negative button or pressing back on Android, or by canceling the
+  /// Face ID / Touch ID sheet on iOS and macOS.
+  ///
+  /// Usually needs no error UI; the user knows they canceled.
   userCanceled,
 
-  /// Authentication prompt is canceled due to another reason
-  /// (like when biometric sensor becamse unavailable like when
-  /// user switches between apps, logsout, etc).
+  /// The system canceled the prompt without an explicit user decision.
+  ///
+  /// Examples: the app moved to the background, another window took focus,
+  /// or the platform could not show authentication UI. Retrying when the app
+  /// is active again is usually appropriate.
   canceled,
-  unknown,
+
+  /// The prompt timed out waiting for the user. Reported on Android only.
   timeout,
+
+  /// Biometry is temporarily locked after too many failed attempts.
+  ///
+  /// On Android the lock clears by itself after roughly 30 seconds. On iOS
+  /// and macOS it clears once the user authenticates with the device
+  /// passcode. Offer to retry later, or authenticate with
+  /// [StorageFileInitOptions.darwinBiometricOnly] /
+  /// [StorageFileInitOptions.androidBiometricOnly] set to `false` so the
+  /// system can offer the device credential.
+  lockedOut,
+
+  /// Biometry is locked until the user unlocks with a device credential.
+  ///
+  /// Reported on Android after repeated lockouts. The biometric prompt
+  /// cannot succeed until the user authenticates with PIN, pattern, or
+  /// password (for example through the device lock screen).
+  lockedOutPermanently,
+
+  /// The user was not recognized and authentication genuinely failed.
+  ///
+  /// On iOS and macOS this is the keychain reporting failed authentication.
+  /// On Android it maps from a sensor that could not process the input.
+  authenticationFailed,
+
+  /// No biometry is enrolled anymore.
+  ///
+  /// Happens when enrollment was removed between the capability check and
+  /// the prompt. Reported on Android; re-check with
+  /// [BiometricStorage.canAuthenticate] and guide the user to re-enroll.
+  noBiometricEnrolled,
+
+  /// The device has no biometric hardware. Reported on Android when a prompt
+  /// was attempted anyway.
+  noHardware,
+
+  /// Biometric hardware is present but currently unavailable. Reported on
+  /// Android; trying again later may succeed.
+  hardwareUnavailable,
+
+  /// Device-credential fallback was requested but no PIN, pattern, or
+  /// password is set up. Reported on Android.
+  passcodeNotSet,
+
+  /// The sensor is disabled until a security update is installed. Reported
+  /// on Android.
+  securityUpdateRequired,
+
+  /// The authentication flow could not be started at all.
+  ///
+  /// On Android this almost always means the activity is not a
+  /// `FlutterFragmentActivity`, which the biometric prompt requires; see the
+  /// package README's setup section.
+  failedToStart,
+
+  /// Reading from the Linux secret service was denied by an AppArmor
+  /// profile, typically inside a snap.
+  /// [BiometricStorage.linuxCheckAppArmorError] probes for this state.
   linuxAppArmorDenied,
+
+  /// The platform reported an error this package has no dedicated code for.
+  /// The [AuthException.message] carries the platform's description.
+  unknown,
 }
 
 const _authErrorCodeMapping = {
   'AuthError:UserCanceled': AuthExceptionCode.userCanceled,
   'AuthError:Canceled': AuthExceptionCode.canceled,
   'AuthError:Timeout': AuthExceptionCode.timeout,
+  'AuthError:LockedOut': AuthExceptionCode.lockedOut,
+  'AuthError:LockedOutPermanently': AuthExceptionCode.lockedOutPermanently,
+  'AuthError:AuthenticationFailed': AuthExceptionCode.authenticationFailed,
+  'AuthError:NoBiometricEnrolled': AuthExceptionCode.noBiometricEnrolled,
+  'AuthError:NoHardware': AuthExceptionCode.noHardware,
+  'AuthError:HardwareUnavailable': AuthExceptionCode.hardwareUnavailable,
+  'AuthError:PasscodeNotSet': AuthExceptionCode.passcodeNotSet,
+  'AuthError:SecurityUpdateRequired': AuthExceptionCode.securityUpdateRequired,
+  'AuthError:FailedToStart': AuthExceptionCode.failedToStart,
+  'AuthError:Unknown': AuthExceptionCode.unknown,
 };
 
-class BiometricStorageException implements Exception {
-  BiometricStorageException(this.message);
+/// Why stored data became unusable, carried by
+/// [StorageInvalidatedException.reason].
+enum StorageInvalidatedReason {
+  /// The platform invalidated the encryption key backing the storage.
+  ///
+  /// On Android this happens when the user changes biometric enrollment
+  /// (adds or removes a fingerprint or face); the Android Keystore then
+  /// permanently invalidates keys that require user authentication.
+  keyInvalidated,
+
+  /// The stored payload exists but cannot be decrypted or parsed safely,
+  /// for example after partial disk corruption.
+  corruptedData,
+}
+
+/// The common base type for every failure this plugin reports.
+///
+/// The hierarchy is sealed, so a `switch` over an instance is exhaustive:
+///
+/// ```dart
+/// try {
+///   await file.read();
+/// } on BiometricStorageException catch (e) {
+///   switch (e) {
+///     case AuthException(:final code):
+///       // The user could not or did not authenticate; inspect [code].
+///     case StorageInvalidatedException():
+///       // The stored value is gone for good; re-provision it.
+///     case BiometricStoragePluginException():
+///       // Unexpected platform failure; report it.
+///   }
+/// }
+/// ```
+sealed class BiometricStorageException implements Exception {
+  /// Creates an exception carrying a human-readable [message].
+  const BiometricStorageException(this.message);
+
+  /// A human-readable description of the failure, suitable for logs.
+  ///
+  /// Not localized; do not show it to end users directly.
   final String message;
 
   @override
-  String toString() {
-    return 'BiometricStorageException{message: $message}';
-  }
+  String toString() => '$runtimeType($message)';
 }
 
-/// Exceptions during authentication operations.
-/// See [AuthExceptionCode] for details.
-class AuthException implements Exception {
-  AuthException(this.code, this.message);
+/// The user could not be authenticated for a storage operation.
+///
+/// Thrown by [BiometricStorageFile.read], [BiometricStorageFile.write] and
+/// [BiometricStorageFile.delete] when authentication fails, is canceled, or
+/// cannot be performed. [code] states the exact reason; the stored data
+/// itself is unaffected and the operation can be retried.
+final class AuthException extends BiometricStorageException {
+  /// Creates an authentication failure with its typed [code].
+  const AuthException(this.code, String message) : super(message);
 
+  /// The typed reason for this failure; see [AuthExceptionCode] for the
+  /// recommended reaction to each value.
   final AuthExceptionCode code;
-  final String message;
 
   @override
-  String toString() {
-    return 'AuthException{code: $code, message: $message}';
-  }
+  String toString() => 'AuthException($code, $message)';
 }
 
+/// The stored value exists but is permanently unusable.
+///
+/// Unlike [AuthException] this is NOT retryable: the underlying data or its
+/// encryption key is gone. Delete the storage (or simply write a new value)
+/// and re-provision the secret, typically by asking the user to sign in
+/// again.
+final class StorageInvalidatedException extends BiometricStorageException {
+  /// Creates an invalidation failure with its typed [reason].
+  const StorageInvalidatedException(this.reason, String message)
+    : super(message);
+
+  /// What invalidated the storage; see [StorageInvalidatedReason].
+  final StorageInvalidatedReason reason;
+
+  @override
+  String toString() => 'StorageInvalidatedException($reason, $message)';
+}
+
+/// An unexpected platform-side failure that is neither an authentication
+/// outcome nor data invalidation.
+///
+/// [code] is the raw platform error code (for example `SecurityError` or
+/// `NoSuchStorage`) and [details] carries any extra diagnostic payload the
+/// platform attached. Seeing this exception usually indicates a bug or an
+/// integration problem worth reporting.
+final class BiometricStoragePluginException extends BiometricStorageException {
+  /// Creates a wrapped platform exception preserving [code] and [details].
+  const BiometricStoragePluginException(this.code, String message, this.details)
+    : super(message);
+
+  /// The raw error code reported by the platform implementation.
+  final String code;
+
+  /// Additional diagnostic information from the platform, often a native
+  /// stack trace. May be `null`.
+  final Object? details;
+
+  @override
+  String toString() => 'BiometricStoragePluginException($code, $message)';
+}
+
+/// Configuration for a storage file, applied once when the storage is
+/// created by [BiometricStorage.getStorage].
+///
+/// The options are persisted natively per storage name; passing different
+/// options for an already created storage has no effect until the storage is
+/// deleted and recreated.
 class StorageFileInitOptions {
-  StorageFileInitOptions({
-    Duration? androidAuthenticationValidityDuration,
-    Duration? darwinTouchIDAuthenticationAllowableReuseDuration,
-    Duration? darwinTouchIDAuthenticationForceReuseContextDuration,
-    @Deprecated(
-        'use use androidAuthenticationValidityDuration, iosTouchIDAuthenticationAllowableReuseDuration or iosTouchIDAuthenticationForceReuseContextDuration instead')
-    int authenticationValidityDurationSeconds = -1,
+  /// Creates storage options; every parameter has a secure-by-default value.
+  const StorageFileInitOptions({
+    this.androidAuthenticationValidityDuration,
+    this.darwinTouchIDAuthenticationAllowableReuseDuration,
+    this.darwinTouchIDAuthenticationForceReuseContextDuration,
     this.authenticationRequired = true,
     this.androidBiometricOnly = true,
     this.darwinBiometricOnly = true,
-  })  : androidAuthenticationValidityDuration =
-            androidAuthenticationValidityDuration ??
-                (authenticationValidityDurationSeconds <= 0
-                    ? null
-                    : Duration(seconds: authenticationValidityDurationSeconds)),
-        darwinTouchIDAuthenticationAllowableReuseDuration =
-            darwinTouchIDAuthenticationAllowableReuseDuration ??
-                (authenticationValidityDurationSeconds <= 0
-                    ? null
-                    : Duration(seconds: authenticationValidityDurationSeconds)),
-        darwinTouchIDAuthenticationForceReuseContextDuration =
-            darwinTouchIDAuthenticationForceReuseContextDuration ??
-                darwinTouchIDAuthenticationAllowableReuseDuration ??
-                (authenticationValidityDurationSeconds <= 0
-                    ? null
-                    : Duration(seconds: authenticationValidityDurationSeconds));
+  });
 
-  /// see https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec.Builder#setUserAuthenticationParameters(int,%20int)
+  /// How long one successful authentication stays valid on Android.
+  ///
+  /// When `null` (the default), every access requires a fresh Class 3
+  /// (strong) biometric authentication cryptographically bound to the
+  /// operation. When set, one authentication unlocks the key for the given
+  /// window and the device credential is accepted as a fallback on
+  /// Android 11 and newer.
+  ///
+  /// Must be set when [androidBiometricOnly] is `false`;
+  /// [BiometricStorage.getStorage] rejects that combination on Android.
+  ///
+  /// See `setUserAuthenticationParameters` in the Android KeyGenParameterSpec
+  /// documentation.
   final Duration? androidAuthenticationValidityDuration;
 
-  /// see https://developer.apple.com/documentation/localauthentication/lacontext/1622329-touchidauthenticationallowablere
-  /// > If the user unlocks the device using Touch ID within the specified time interval, then authentication for the receiver succeeds automatically, without prompting the user for Touch ID. This bypasses a scenario where the user unlocks the device and then is almost immediately prompted for another fingerprint.
-  /// and https://developer.apple.com/documentation/localauthentication/accessing_keychain_items_with_face_id_or_touch_id
-  /// > Note that this grace period applies specifically to device unlock with Touch ID, not keychain retrieval authentications
+  /// The grace period after a device unlock with Touch ID during which
+  /// keychain access does not prompt again, on iOS and macOS.
   ///
-  /// If you want to avoid requiring authentication after a successful
-  /// keychain retrieval see [darwinTouchIDAuthenticationForceReuseContextDuration]
+  /// Values above the system maximum of 5 minutes are clamped natively.
+  /// This mirrors `LAContext.touchIDAuthenticationAllowableReuseDuration`
+  /// and applies specifically to device unlock, not to previous keychain
+  /// prompts; to avoid re-prompting after a successful keychain operation
+  /// use [darwinTouchIDAuthenticationForceReuseContextDuration] instead.
   final Duration? darwinTouchIDAuthenticationAllowableReuseDuration;
 
-  /// To prevent forcing the user to authenticate again after unlocking once
-  /// we can reuse the `LAContext` object for the given amount of time.
-  /// see https://github.com/authpass/biometric_storage/pull/73
-  /// This is pretty much undocumented behavior, but works similar to
-  /// `androidAuthenticationValidityDuration`.
+  /// How long the plugin reuses one authenticated `LAContext` for further
+  /// keychain operations on iOS and macOS.
   ///
-  /// See also [darwinTouchIDAuthenticationAllowableReuseDuration]
+  /// While the context is reused, reads and writes within this window do not
+  /// prompt again, similar to [androidAuthenticationValidityDuration] on
+  /// Android. Independent of
+  /// [darwinTouchIDAuthenticationAllowableReuseDuration]; setting one does
+  /// not imply the other.
   final Duration? darwinTouchIDAuthenticationForceReuseContextDuration;
 
-  /// Whether an authentication is required. if this is
-  /// false NO BIOMETRIC CHECK WILL BE PERFORMED! and the value
-  /// will simply be save encrypted. (default: true)
+  /// Whether accessing this storage requires the user to authenticate.
+  ///
+  /// When `false` NO authentication gate exists: values are still stored
+  /// through the platform keystore or keychain, but any app code can read
+  /// them without a prompt.
   final bool authenticationRequired;
 
-  /// Only makes difference on Android, where if set true, you can't use
-  /// PIN/pattern/password to get the file.
-  /// On Android < 30 this will always be ignored. (always `true`)
-  /// https://github.com/authpass/biometric_storage/issues/12#issuecomment-900358154
+  /// Whether Android may only use biometrics, excluding PIN, pattern, and
+  /// password fallback.
   ///
-  /// Also: this **must** be `true` if [androidAuthenticationValidityDuration]
-  /// is null.
-  /// https://github.com/authpass/biometric_storage/issues/12#issuecomment-902508609
+  /// When `false`, the device credential is offered as a fallback, which
+  /// requires Android 11 or newer (older versions ignore the fallback) and
+  /// requires [androidAuthenticationValidityDuration] to be set because
+  /// auth-per-use keys only support biometric authentication.
   final bool androidBiometricOnly;
 
-  /// Only for iOS and macOS:
-  /// Uses `.biometryCurrentSet` if true, `.userPresence` otherwise.
-  /// https://developer.apple.com/documentation/security/secaccesscontrolcreateflags/1392879-userpresence
+  /// Whether iOS and macOS may only use biometry that is currently enrolled
+  /// (`.biometryCurrentSet`), excluding the device passcode.
+  ///
+  /// When `false`, `.userPresence` is used instead and the system offers the
+  /// passcode as a fallback. Note that with `.biometryCurrentSet` the stored
+  /// item becomes unreadable if the user re-enrolls biometry.
   final bool darwinBiometricOnly;
 
+  /// The wire representation sent to the platform implementations.
+  ///
+  /// The key names are a fixed part of the plugin's internal protocol.
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'androidAuthenticationValidityDurationSeconds':
-            androidAuthenticationValidityDuration?.inSeconds,
-        'darwinTouchIDAuthenticationAllowableReuseDurationSeconds':
-            darwinTouchIDAuthenticationAllowableReuseDuration?.inSeconds,
-        'darwinTouchIDAuthenticationForceReuseContextDurationSeconds':
-            darwinTouchIDAuthenticationForceReuseContextDuration?.inSeconds,
-        'authenticationRequired': authenticationRequired,
-        'androidBiometricOnly': androidBiometricOnly,
-        'darwinBiometricOnly': darwinBiometricOnly,
-      };
+    'androidAuthenticationValidityDurationSeconds':
+        androidAuthenticationValidityDuration?.inSeconds,
+    'darwinTouchIDAuthenticationAllowableReuseDurationSeconds':
+        darwinTouchIDAuthenticationAllowableReuseDuration?.inSeconds,
+    'darwinTouchIDAuthenticationForceReuseContextDurationSeconds':
+        darwinTouchIDAuthenticationForceReuseContextDuration?.inSeconds,
+    'authenticationRequired': authenticationRequired,
+    'androidBiometricOnly': androidBiometricOnly,
+    'darwinBiometricOnly': darwinBiometricOnly,
+  };
 }
 
-/// Android specific configuration of the prompt displayed for biometry.
+/// Texts and behavior of the Android system authentication prompt.
+///
+/// Android renders one prompt per protected operation; these values fill the
+/// system-provided sheet. See [PromptInfo] for how the per-platform
+/// configurations are combined.
 class AndroidPromptInfo {
+  /// Creates the Android prompt configuration.
   const AndroidPromptInfo({
     this.title = 'Authenticate to unlock data',
     this.subtitle,
@@ -174,70 +400,124 @@ class AndroidPromptInfo {
     this.confirmationRequired = true,
   });
 
+  /// The headline of the prompt sheet.
   final String title;
+
+  /// An optional second line below [title].
   final String? subtitle;
+
+  /// Optional longer text explaining why authentication is needed.
   final String? description;
+
+  /// The label of the cancel button.
+  ///
+  /// Only shown when [StorageFileInitOptions.androidBiometricOnly] is `true`;
+  /// with device-credential fallback Android replaces it with the fallback
+  /// entry point.
   final String negativeButton;
+
+  /// Whether passive biometrics (like face unlock) require an explicit
+  /// confirmation tap after recognition.
   final bool confirmationRequired;
 
+  /// The configuration used when none is provided explicitly.
   static const defaultValues = AndroidPromptInfo();
 
   Map<String, dynamic> _toJson() => <String, dynamic>{
-        'title': title,
-        'subtitle': subtitle,
-        'description': description,
-        'negativeButton': negativeButton,
-        'confirmationRequired': confirmationRequired,
-      };
+    'title': title,
+    'subtitle': subtitle,
+    'description': description,
+    'negativeButton': negativeButton,
+    'confirmationRequired': confirmationRequired,
+  };
 }
 
-/// iOS **and MacOS** specific configuration of the prompt displayed for biometry.
-class IosPromptInfo {
-  const IosPromptInfo({
+/// Prompt messages shown by iOS and macOS when the keychain asks the user to
+/// authenticate.
+///
+/// Apple's UI only exposes a single reason string per operation; [saveTitle]
+/// is used while writing and [accessTitle] while reading or deleting.
+class DarwinPromptInfo {
+  /// Creates the iOS/macOS prompt configuration.
+  const DarwinPromptInfo({
     this.saveTitle = 'Unlock to save data',
     this.accessTitle = 'Unlock to access data',
   });
 
+  /// The reason shown while writing a value.
   final String saveTitle;
+
+  /// The reason shown while reading or deleting a value.
   final String accessTitle;
 
-  static const defaultValues = IosPromptInfo();
+  /// The configuration used when none is provided explicitly.
+  static const defaultValues = DarwinPromptInfo();
 
   Map<String, dynamic> _toJson() => <String, dynamic>{
-        'saveTitle': saveTitle,
-        'accessTitle': accessTitle,
-      };
+    'saveTitle': saveTitle,
+    'accessTitle': accessTitle,
+  };
 }
 
-/// Wrapper for platform specific prompt infos.
+/// The pre-6.0 name of [DarwinPromptInfo].
+@Deprecated(
+  'Use DarwinPromptInfo instead. '
+  'The alias will be removed in 7.0.0.',
+)
+typedef IosPromptInfo = DarwinPromptInfo;
+
+/// The per-platform prompt configurations for one storage operation.
+///
+/// Only the configuration matching the current platform is sent to the
+/// native side; the others are ignored, so one [PromptInfo] can safely be
+/// shared across a cross-platform code base.
 class PromptInfo {
+  /// Creates a bundle of per-platform prompt configurations.
   const PromptInfo({
     this.androidPromptInfo = AndroidPromptInfo.defaultValues,
-    this.iosPromptInfo = IosPromptInfo.defaultValues,
-    this.macOsPromptInfo = IosPromptInfo.defaultValues,
+    this.iosPromptInfo = DarwinPromptInfo.defaultValues,
+    this.macOsPromptInfo = DarwinPromptInfo.defaultValues,
   });
+
+  /// The configuration used when none is provided explicitly.
   static const defaultValues = PromptInfo();
 
+  /// Prompt texts used on Android.
   final AndroidPromptInfo androidPromptInfo;
-  final IosPromptInfo iosPromptInfo;
-  final IosPromptInfo macOsPromptInfo;
+
+  /// Prompt texts used on iOS.
+  final DarwinPromptInfo iosPromptInfo;
+
+  /// Prompt texts used on macOS.
+  final DarwinPromptInfo macOsPromptInfo;
 }
 
-/// Main plugin class to interact with. Is always a singleton right now,
-/// factory constructor will always return the same instance.
+/// The entry point for biometric/secure storage.
 ///
-/// * call [canAuthenticate] to check support on the platform/device.
-/// * call [getStorage] to initialize a storage.
+/// `BiometricStorage()` returns the platform singleton. Typical usage:
+///
+/// ```dart
+/// final support = await BiometricStorage().canAuthenticate();
+/// if (support == CanAuthenticateResponse.success) {
+///   final storage = await BiometricStorage().getStorage('my_token');
+///   await storage.write('secret');
+///   final value = await storage.read();
+/// }
+/// ```
+///
+/// See [CanAuthenticateResponse] for interpreting capability results and
+/// [BiometricStorageException] for the failure contract of all operations.
 abstract class BiometricStorage extends PlatformInterface {
-  // Returns singleton instance.
+  /// The active platform implementation.
   factory BiometricStorage() => _instance;
 
+  /// Constructor for platform implementations to call as `super.create()`.
   BiometricStorage.create() : super(token: _token);
 
   static BiometricStorage _instance = MethodChannelBiometricStorage();
 
-  /// Platform-specific plugins should set this with their own platform-specific
-  /// class that extends [UrlLauncherPlatform] when they register themselves.
+  /// Registers a platform-specific implementation, replacing the default
+  /// method-channel one. Called by the Windows and web backends.
   static set instance(BiometricStorage instance) {
     PlatformInterface.verifyToken(instance, _token);
     _instance = instance;
@@ -245,32 +525,42 @@ abstract class BiometricStorage extends PlatformInterface {
 
   static const Object _token = Object();
 
-  /// Returns whether this device supports biometric/secure storage or
-  /// the reason [CanAuthenticateResponse] why it is not supported.
+  /// Whether this device can authenticate the user right now, and if not,
+  /// why.
+  ///
+  /// Pass [options] when the storage will be created with non-default
+  /// authenticator settings (for example
+  /// [StorageFileInitOptions.androidBiometricOnly] set to `false`), so the
+  /// check matches the authenticators that will actually be used.
   Future<CanAuthenticateResponse> canAuthenticate({
     StorageFileInitOptions? options,
   });
 
-  /// Returns true when there is an AppArmor error when trying to read a value.
+  /// Whether reading from the Linux secret service is blocked by an
+  /// AppArmor policy, as happens inside snaps without the right plugs.
   ///
-  /// When used inside a snap, there might be app armor limitations
-  /// which lead to an error like:
-  /// org.freedesktop.DBus.Error.AccessDenied: An AppArmor policy prevents
-  /// this sender from sending this message to this recipient;
-  /// type="method_call", sender=":1.140" (uid=1000 pid=94358
-  /// comm="/snap/biometric-storage-example/x1/biometric_stora"
-  /// label="snap.biometric-storage-example.biometric (enforce)")
-  /// interface="org.freedesktop.Secret.Service" member="OpenSession"
-  /// error name="(unset)" requested_reply="0" destination=":1.30"
-  /// (uid=1000 pid=1153 comm="/usr/bin/gnome-keyring-daemon
-  /// --daemonize --login " label="unconfined")
+  /// Performs a real read against a throwaway, non-authenticated storage
+  /// entry and returns `true` when the denial signature is detected.
+  /// Always returns `false` on other platforms.
   Future<bool> linuxCheckAppArmorError();
 
-  /// Retrieves the given biometric storage file.
-  /// Each store is completely separated, and has it's own encryption and
-  /// biometric lock.
-  /// if [forceInit] is true, will throw an exception if the store was already
-  /// created in this runtime.
+  /// Opens (creating on first use) the storage file named [name].
+  ///
+  /// Each name is a fully separate store with its own encryption key and
+  /// its own [options]; the options are applied when the store is first
+  /// created and ignored afterwards. The returned [BiometricStorageFile]
+  /// uses [promptInfo] for operations that do not pass their own.
+  ///
+  /// The [name] must be a plain identifier: not empty and without `/` or
+  /// `\` characters; anything else throws an [ArgumentError] before any
+  /// platform code runs. On Android, combining
+  /// `androidBiometricOnly: false` with a `null`
+  /// [StorageFileInitOptions.androidAuthenticationValidityDuration] also
+  /// throws an [ArgumentError] because the platform cannot express it.
+  ///
+  /// If [forceInit] is `true` and the storage was already initialized in
+  /// this process, throws a [BiometricStoragePluginException] with code
+  /// `AlreadyInitialized`.
   Future<BiometricStorageFile> getStorage(
     String name, {
     StorageFileInitOptions? options,
@@ -278,27 +568,29 @@ abstract class BiometricStorage extends PlatformInterface {
     PromptInfo promptInfo = PromptInfo.defaultValues,
   });
 
+  /// Reads the current value of the store named [name].
+  ///
+  /// Prefer [BiometricStorageFile.read]; this exists for implementations.
   @protected
-  Future<String?> read(
-    String name,
-    PromptInfo promptInfo,
-  );
+  Future<String?> read(String name, PromptInfo promptInfo);
 
+  /// Deletes the store named [name].
+  ///
+  /// Prefer [BiometricStorageFile.delete]; this exists for implementations.
   @protected
-  Future<bool?> delete(
-    String name,
-    PromptInfo promptInfo,
-  );
+  Future<bool?> delete(String name, PromptInfo promptInfo);
 
+  /// Writes [content] into the store named [name].
+  ///
+  /// Prefer [BiometricStorageFile.write]; this exists for implementations.
   @protected
-  Future<void> write(
-    String name,
-    String content,
-    PromptInfo promptInfo,
-  );
+  Future<void> write(String name, String content, PromptInfo promptInfo);
 }
 
+/// The method-channel implementation of [BiometricStorage], used on
+/// Android, iOS, macOS, and Linux.
 class MethodChannelBiometricStorage extends BiometricStorage {
+  /// Creates the method-channel backed implementation.
   MethodChannelBiometricStorage() : super.create();
 
   static const MethodChannel _channel = MethodChannel('biometric_storage');
@@ -307,69 +599,54 @@ class MethodChannelBiometricStorage extends BiometricStorage {
   Future<CanAuthenticateResponse> canAuthenticate({
     StorageFileInitOptions? options,
   }) async {
+    // On the web the registered web implementation replaces this class;
+    // this guard only protects exotic embedders that skip registration.
     if (kIsWeb) {
       return CanAuthenticateResponse.unsupported;
     }
-    if (Platform.isAndroid ||
-        Platform.isIOS ||
-        Platform.isMacOS ||
-        Platform.isLinux) {
-      final response = await _channel.invokeMethod<String>(
-        'canAuthenticate',
-        {
-          'options': options?.toJson() ?? StorageFileInitOptions().toJson(),
-        },
-      );
-      final ret = _canAuthenticateMapping[response];
-      if (ret == null) {
-        throw StateError('Invalid response from native platform. {$response}');
-      }
-      return ret;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+      case TargetPlatform.macOS:
+      case TargetPlatform.linux:
+        final response = await _channel.invokeMethod<String>(
+          'canAuthenticate',
+          {'options': (options ?? const StorageFileInitOptions()).toJson()},
+        );
+        final ret = _canAuthenticateMapping[response];
+        if (ret == null) {
+          throw StateError(
+            'Invalid response from native platform. '
+            '{$response}',
+          );
+        }
+        return ret;
+      case TargetPlatform.windows:
+      case TargetPlatform.fuchsia:
+        return CanAuthenticateResponse.unsupported;
     }
-    return CanAuthenticateResponse.unsupported;
   }
 
-  /// Returns true when there is an AppArmor error when trying to read a value.
-  ///
-  /// When used inside a snap, there might be app armor limitations
-  /// which lead to an error like:
-  /// org.freedesktop.DBus.Error.AccessDenied: An AppArmor policy prevents
-  /// this sender from sending this message to this recipient;
-  /// type="method_call", sender=":1.140" (uid=1000 pid=94358
-  /// comm="/snap/biometric-storage-example/x1/biometric_stora"
-  /// label="snap.biometric-storage-example.biometric (enforce)")
-  /// interface="org.freedesktop.Secret.Service" member="OpenSession"
-  /// error name="(unset)" requested_reply="0" destination=":1.30"
-  /// (uid=1000 pid=1153 comm="/usr/bin/gnome-keyring-daemon
-  /// --daemonize --login " label="unconfined")
   @override
   Future<bool> linuxCheckAppArmorError() async {
-    if (!Platform.isLinux) {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.linux) {
       return false;
     }
-    final tmpStorage = await getStorage('appArmorCheck',
-        options: StorageFileInitOptions(authenticationRequired: false));
-    _logger.finer('Checking app armor');
+    final tmpStorage = await getStorage(
+      'appArmorCheck',
+      options: const StorageFileInitOptions(authenticationRequired: false),
+    );
     try {
       await tmpStorage.read();
-      _logger.finer('Everything okay.');
       return false;
-    } on AuthException catch (e, stackTrace) {
+    } on AuthException catch (e) {
       if (e.code == AuthExceptionCode.linuxAppArmorDenied) {
         return true;
       }
-      _logger.warning(
-          'Unknown error while checking for app armor.', e, stackTrace);
-      // some other weird error?
       rethrow;
     }
   }
 
-  /// Retrieves the given biometric storage file.
-  /// Each store is completely separated, and has it's own encryption and
-  /// biometric lock.
-  /// if [forceInit] is true, will throw an exception if the store was already
-  /// created in this runtime.
   @override
   Future<BiometricStorageFile> getStorage(
     String name, {
@@ -377,134 +654,198 @@ class MethodChannelBiometricStorage extends BiometricStorage {
     bool forceInit = false,
     PromptInfo promptInfo = PromptInfo.defaultValues,
   }) async {
-    try {
-      final result = await _channel.invokeMethod<bool>(
-        'init',
-        {
-          'name': name,
-          'options': options?.toJson() ?? StorageFileInitOptions().toJson(),
-          'forceInit': forceInit,
-        },
-      );
-      _logger.finest('getting storage. was created: $result');
-      return BiometricStorageFile(
-        this,
+    _validateName(name);
+    final resolvedOptions = options ?? const StorageFileInitOptions();
+    _validateOptionsForPlatform(resolvedOptions);
+    await _transformErrors(
+      _channel.invokeMethod<bool>('init', {
+        'name': name,
+        'options': resolvedOptions.toJson(),
+        'forceInit': forceInit,
+      }),
+    );
+    return BiometricStorageFile(this, name, promptInfo);
+  }
+
+  /// Rejects names that would escape the per-store namespace.
+  ///
+  /// Android additionally validates this natively; checking here gives every
+  /// platform the same fail-fast behavior before any IO happens.
+  static void _validateName(String name) {
+    if (name.isEmpty) {
+      throw ArgumentError.value(
         name,
-        promptInfo,
+        'name',
+        'Storage name must not be empty.',
       );
-    } catch (e, stackTrace) {
-      _logger.warning(
-          'Error while initializing biometric storage.', e, stackTrace);
-      rethrow;
+    }
+    if (name.contains('/') || name.contains(r'\')) {
+      throw ArgumentError.value(
+        name,
+        'name',
+        'Storage name must be a plain name without path separators.',
+      );
+    }
+  }
+
+  /// Rejects option combinations the current platform cannot express, so
+  /// misconfiguration fails at development time instead of surfacing as a
+  /// native error during the first read.
+  static void _validateOptionsForPlatform(StorageFileInitOptions options) {
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      if (!options.androidBiometricOnly &&
+          options.androidAuthenticationValidityDuration == null) {
+        throw ArgumentError(
+          'androidBiometricOnly: false requires '
+          'androidAuthenticationValidityDuration to be set, because '
+          'auth-per-use keys only support biometric authentication on '
+          'Android.',
+        );
+      }
     }
   }
 
   @override
-  Future<String?> read(
-    String name,
-    PromptInfo promptInfo,
-  ) =>
-      _transformErrors(_channel.invokeMethod<String>('read', <String, dynamic>{
-        'name': name,
-        ..._promptInfoForCurrentPlatform(promptInfo),
-      }));
+  Future<String?> read(String name, PromptInfo promptInfo) => _transformErrors(
+    _channel.invokeMethod<String>('read', <String, dynamic>{
+      'name': name,
+      ..._promptInfoForCurrentPlatform(promptInfo),
+    }),
+  );
 
   @override
-  Future<bool?> delete(
-    String name,
-    PromptInfo promptInfo,
-  ) =>
-      _transformErrors(_channel.invokeMethod<bool>('delete', <String, dynamic>{
-        'name': name,
-        ..._promptInfoForCurrentPlatform(promptInfo),
-      }));
+  Future<bool?> delete(String name, PromptInfo promptInfo) => _transformErrors(
+    _channel.invokeMethod<bool>('delete', <String, dynamic>{
+      'name': name,
+      ..._promptInfoForCurrentPlatform(promptInfo),
+    }),
+  );
 
   @override
-  Future<void> write(
-    String name,
-    String content,
-    PromptInfo promptInfo,
-  ) =>
-      _transformErrors(_channel.invokeMethod('write', <String, dynamic>{
-        'name': name,
-        'content': content,
-        ..._promptInfoForCurrentPlatform(promptInfo),
-      }));
+  Future<void> write(String name, String content, PromptInfo promptInfo) =>
+      _transformErrors(
+        _channel.invokeMethod('write', <String, dynamic>{
+          'name': name,
+          'content': content,
+          ..._promptInfoForCurrentPlatform(promptInfo),
+        }),
+      );
 
+  /// The prompt payload for the current platform only, so Android texts are
+  /// never sent to iOS and vice versa.
   Map<String, dynamic> _promptInfoForCurrentPlatform(PromptInfo promptInfo) {
-    // Don't expose Android configurations to other platforms
-    if (Platform.isAndroid) {
-      return <String, dynamic>{
-        'androidPromptInfo': promptInfo.androidPromptInfo._toJson()
-      };
-    } else if (Platform.isIOS) {
-      return <String, dynamic>{
-        'iosPromptInfo': promptInfo.iosPromptInfo._toJson()
-      };
-    } else if (Platform.isMacOS) {
-      return <String, dynamic>{
-        // This is no typo, we use the same implementation on iOS and MacOS,
-        // so we use the same parameter.
-        'iosPromptInfo': promptInfo.macOsPromptInfo._toJson()
-      };
-    } else if (Platform.isLinux) {
-      return <String, dynamic>{};
-    } else {
-      // Windows has no method channel implementation
-      // Web has a Noop implementation.
-      throw StateError('Unsupported Platform ${Platform.operatingSystem}');
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        return <String, dynamic>{
+          'androidPromptInfo': promptInfo.androidPromptInfo._toJson(),
+        };
+      case TargetPlatform.iOS:
+        return <String, dynamic>{
+          'iosPromptInfo': promptInfo.iosPromptInfo._toJson(),
+        };
+      case TargetPlatform.macOS:
+        // iOS and macOS share one native implementation, hence one wire key.
+        return <String, dynamic>{
+          'iosPromptInfo': promptInfo.macOsPromptInfo._toJson(),
+        };
+      case TargetPlatform.linux:
+        return <String, dynamic>{};
+      case TargetPlatform.windows:
+      case TargetPlatform.fuchsia:
+        // Windows registers a Dart-only implementation; reaching this line
+        // means the platform setup is broken.
+        throw StateError(
+          'Unsupported platform $defaultTargetPlatform for method channel '
+          'operations.',
+        );
     }
   }
 
+  /// Converts platform-channel failures into the sealed
+  /// [BiometricStorageException] hierarchy; every other error type passes
+  /// through untouched.
   Future<T> _transformErrors<T>(Future<T> future) =>
       future.catchError((Object error, StackTrace stackTrace) {
         if (error is PlatformException) {
-          _logger.finest(
-              'Error during plugin operation (details: ${error.details})',
-              error,
-              stackTrace);
-          if (error.code.startsWith('AuthError:')) {
-            return Future<T>.error(
-              AuthException(
-                _authErrorCodeMapping[error.code] ?? AuthExceptionCode.unknown,
-                error.message ?? 'Unknown error',
-              ),
-              stackTrace,
-            );
-          }
-          if (error.details is Map) {
-            final message = error.details['message'] as String;
-            if (message.contains('org.freedesktop.DBus.Error.AccessDenied') ||
-                message.contains('AppArmor')) {
-              _logger.fine('Got app armor error.');
-              return Future<T>.error(
-                  AuthException(
-                      AuthExceptionCode.linuxAppArmorDenied, error.message!),
-                  stackTrace);
-            }
-          }
+          return Future<T>.error(_mapPlatformException(error), stackTrace);
         }
         return Future<T>.error(error, stackTrace);
       });
+
+  static BiometricStorageException _mapPlatformException(
+    PlatformException error,
+  ) {
+    final message = error.message ?? error.code;
+    if (error.code.startsWith('AuthError:')) {
+      return AuthException(
+        _authErrorCodeMapping[error.code] ?? AuthExceptionCode.unknown,
+        message,
+      );
+    }
+    if (error.code == 'StorageError:KeyInvalidated') {
+      return StorageInvalidatedException(
+        StorageInvalidatedReason.keyInvalidated,
+        message,
+      );
+    }
+    if (error.code == 'StorageError:CorruptedData') {
+      return StorageInvalidatedException(
+        StorageInvalidatedReason.corruptedData,
+        message,
+      );
+    }
+    final details = error.details;
+    if (details is Map) {
+      final detailMessage = details['message'];
+      if (detailMessage is String &&
+          (detailMessage.contains('org.freedesktop.DBus.Error.AccessDenied') ||
+              detailMessage.contains('AppArmor'))) {
+        return AuthException(AuthExceptionCode.linuxAppArmorDenied, message);
+      }
+    }
+    return BiometricStoragePluginException(error.code, message, error.details);
+  }
 }
 
+/// One named, isolated secure store obtained from
+/// [BiometricStorage.getStorage].
+///
+/// All operations may show a platform authentication prompt (depending on
+/// the store's [StorageFileInitOptions]) and throw subtypes of
+/// [BiometricStorageException] on failure.
 class BiometricStorageFile {
+  /// Binds the store [name] to [_plugin] with its [defaultPromptInfo].
   BiometricStorageFile(this._plugin, this.name, this.defaultPromptInfo);
 
   final BiometricStorage _plugin;
+
+  /// The unique name of this store, as passed to
+  /// [BiometricStorage.getStorage].
   final String name;
+
+  /// The prompt configuration used when an operation does not pass its own.
   final PromptInfo defaultPromptInfo;
 
-  /// read from the secure file and returns the content.
-  /// Will return `null` if file does not exist.
+  /// The stored value, or `null` when nothing was stored yet (or the value
+  /// was deleted).
+  ///
+  /// Throws an [AuthException] when the user cannot be authenticated and a
+  /// [StorageInvalidatedException] when the value is permanently
+  /// unrecoverable.
   Future<String?> read({PromptInfo? promptInfo}) =>
       _plugin.read(name, promptInfo ?? defaultPromptInfo);
 
-  /// Write content of this file. Previous value will be overwritten.
+  /// Overwrites the stored value with [content].
+  ///
+  /// Throws an [AuthException] when the user cannot be authenticated; in
+  /// that case the previous value stays intact.
   Future<void> write(String content, {PromptInfo? promptInfo}) =>
       _plugin.write(name, content, promptInfo ?? defaultPromptInfo);
 
-  /// Delete the content of this storage.
+  /// Deletes the stored value.
+  ///
+  /// Completes normally when nothing was stored. After deleting, [read]
+  /// returns `null`.
   Future<void> delete({PromptInfo? promptInfo}) =>
       _plugin.delete(name, promptInfo ?? defaultPromptInfo);
 }
