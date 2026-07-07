@@ -1,5 +1,6 @@
 package com.example.biometric_storage_example
 
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 
-class MainActivity : FlutterActivity()
+// biometric_storage shows BiometricPrompt, which requires a FragmentActivity.
+class MainActivity : FlutterFragmentActivity()

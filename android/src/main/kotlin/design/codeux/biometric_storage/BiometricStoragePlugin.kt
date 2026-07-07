@@ -2,512 +2,406 @@ package design.codeux.biometric_storage
 
 import android.app.Activity
 import android.content.Context
-import android.os.*
-import android.security.KeyStoreException
+import android.os.Handler
+import android.os.Looper
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.UserNotAuthenticatedException
-import androidx.annotation.AnyThread
-import androidx.annotation.UiThread
+import androidx.annotation.MainThread
 import androidx.annotation.WorkerThread
-import androidx.biometric.*
-import androidx.biometric.BiometricManager.Authenticators.*
 import androidx.fragment.app.FragmentActivity
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.embedding.engine.plugins.activity.*
-import io.flutter.plugin.common.*
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-import io.github.oshai.kotlinlogging.KotlinLogging
-import java.io.PrintWriter
-import java.io.StringWriter
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import kotlin.time.Duration.Companion.seconds
 
-private val logger = KotlinLogging.logger {}
-
-enum class CipherMode {
-    Encrypt,
-    Decrypt,
-}
-
-typealias ErrorCallback = (errorInfo: AuthenticationErrorInfo) -> Unit
-
-class MethodCallException(
-    val errorCode: String,
-    val errorMessage: String?,
-    val errorDetails: Any? = null
-) : Exception(errorMessage ?: errorCode)
-
-@Suppress("unused")
-enum class CanAuthenticateResponse(val code: Int) {
-    Success(BiometricManager.BIOMETRIC_SUCCESS),
-    ErrorHwUnavailable(BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE),
-    ErrorNoBiometricEnrolled(BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED),
-    ErrorNoHardware(BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE),
-    ErrorStatusUnknown(BiometricManager.BIOMETRIC_STATUS_UNKNOWN),
-    ErrorPasscodeNotSet(-99),
-    ;
-
-    override fun toString(): String {
-        return "CanAuthenticateResponse.${name}: $code"
-    }
-}
-
-@Suppress("unused")
-enum class AuthenticationError(vararg val code: Int) {
-    Canceled(BiometricPrompt.ERROR_CANCELED),
-    Timeout(BiometricPrompt.ERROR_TIMEOUT),
-    UserCanceled(BiometricPrompt.ERROR_USER_CANCELED, BiometricPrompt.ERROR_NEGATIVE_BUTTON),
-    Unknown(-1),
-
-    /** Authentication valid, but unknown */
-    Failed(-2),
-    ;
-
-    companion object {
-        fun forCode(code: Int) =
-            entries.firstOrNull { it.code.contains(code) } ?: Unknown
-    }
-}
-
-data class AuthenticationErrorInfo(
-    val error: AuthenticationError,
-    val message: CharSequence,
-    val errorDetails: String? = null
-) {
-    constructor(
-        error: AuthenticationError,
-        message: CharSequence,
-        e: Throwable
-    ) : this(error, message, e.toCompleteString())
-}
-
-private fun Throwable.toCompleteString(): String {
-    val out = StringWriter().let { out ->
-        printStackTrace(PrintWriter(out))
-        out.toString()
-    }
-    return "$this\n$out"
-}
-
+/**
+ * Android implementation of the `biometric_storage` plugin.
+ *
+ * Values are encrypted with AES/GCM keys kept in the Android Keystore and,
+ * when authentication is required, gated behind the system biometric prompt.
+ *
+ * Threading model: method calls arrive on the platform main thread, all
+ * keystore and file work runs on a single background worker, prompts are
+ * shown on the main thread and every reply is delivered exactly once on the
+ * main thread through [MainThreadResult].
+ */
 class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
 
     companion object {
-        const val PARAM_NAME = "name"
-        const val PARAM_WRITE_CONTENT = "content"
-        const val PARAM_ANDROID_PROMPT_INFO = "androidPromptInfo"
-
+        private const val CHANNEL_NAME = "biometric_storage"
+        private const val PARAM_NAME = "name"
+        private const val PARAM_WRITE_CONTENT = "content"
+        private const val PARAM_ANDROID_PROMPT_INFO = "androidPromptInfo"
     }
 
-    private val executor: ExecutorService by lazy { Executors.newSingleThreadExecutor() }
-    private val handler: Handler by lazy { Handler(Looper.getMainLooper()) }
-
-
+    private lateinit var applicationContext: Context
+    private lateinit var authenticator: BiometricAuthenticator
+    private var channel: MethodChannel? = null
+    private var workerExecutor: ExecutorService? = null
     private var attachedActivity: FragmentActivity? = null
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val storageFiles = mutableMapOf<String, BiometricStorageFile>()
 
-    private val biometricManager by lazy { BiometricManager.from(applicationContext) }
-
-    private lateinit var applicationContext: Context
-
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        this.applicationContext = binding.applicationContext
-        val channel = MethodChannel(binding.binaryMessenger, "biometric_storage")
-        channel.setMethodCallHandler(this)
+        applicationContext = binding.applicationContext
+        authenticator = BiometricAuthenticator(binding.applicationContext)
+        workerExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "BiometricStorageWorker")
+        }
+        channel = MethodChannel(binding.binaryMessenger, CHANNEL_NAME).also {
+            it.setMethodCallHandler(this)
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        executor.shutdown()
+        channel?.setMethodCallHandler(null)
+        channel = null
+        workerExecutor?.shutdown()
+        workerExecutor = null
+        storageFiles.clear()
     }
 
-    override fun onMethodCall(call: MethodCall, result: Result) {
-        logger.trace { "onMethodCall(${call.method})" }
+    override fun onMethodCall(call: MethodCall, rawResult: Result) {
+        StorageLog.d { "onMethodCall(${call.method})" }
+        val result = MainThreadResult(rawResult)
         try {
-            fun <T> requiredArgument(name: String) =
-                call.argument<T>(name) ?: throw MethodCallException(
-                    "MissingArgument",
-                    "Missing required argument '$name'"
-                )
+            when (call.method) {
+                "canAuthenticate" ->
+                    result.success(authenticator.canAuthenticate(parseInitOptions(call)).name)
 
-            // every method call requires the name of the stored file.
-            val getName = { requiredArgument<String>(PARAM_NAME) }
-            val getAndroidPromptInfo = {
-                requiredArgument<Map<String, Any>>(PARAM_ANDROID_PROMPT_INFO).let {
-                    AndroidPromptInfo(
-                        title = it["title"] as String,
-                        subtitle = it["subtitle"] as String?,
-                        description = it["description"] as String?,
-                        negativeButton = it["negativeButton"] as String,
-                        confirmationRequired = it["confirmationRequired"] as Boolean,
-                    )
-                }
-            }
+                "init" -> initStorage(call, result)
 
-            fun withStorage(cb: BiometricStorageFile.() -> Unit) {
-                val name = getName()
-                storageFiles[name]?.apply(cb) ?: run {
-                    logger.warn { "User tried to access storage '$name', before initialization" }
-                    result.error("NoSuchStorage", "Storage $name was not initialized.", null)
-                    return
-                }
-            }
+                "dispose" -> disposeStorage(call, result)
 
-            fun Result.sendStorageFailure(exception: MethodCallException) {
-                error(exception.errorCode, exception.errorMessage, exception.errorDetails)
-            }
-
-            fun storageFailure(error: Throwable): MethodCallException? = when (error) {
-                is MethodCallException -> error
-                is InvalidatedStorageKeyException,
-                is KeyPermanentlyInvalidatedException -> MethodCallException(
-                    "StorageError:KeyInvalidated",
-                    "The Android Keystore entry was invalidated. Recreate the storage and write the secret again.",
-                    error.toCompleteString()
-                )
-
-                is CorruptedStorageDataException -> MethodCallException(
-                    "StorageError:CorruptedData",
-                    error.message,
-                    error.toCompleteString()
-                )
-
-                else -> null
-            }
-
-            val resultError: ErrorCallback = { errorInfo ->
-                result.error(
-                    "AuthError:${errorInfo.error}",
-                    errorInfo.message.toString(),
-                    errorInfo.errorDetails
-                )
-                logger.error { "AuthError: $errorInfo" }
-
-            }
-
-            @UiThread
-            fun BiometricStorageFile.withAuth(
-                mode: CipherMode,
-                @WorkerThread cb: BiometricStorageFile.(cipher: Cipher?) -> Unit
-            ) {
-                if (!options.authenticationRequired) {
-                    return cb(null)
-                }
-
-                fun cipherForMode() = when (mode) {
-                    CipherMode.Encrypt -> cipherForEncrypt()
-                    CipherMode.Decrypt -> cipherForDecrypt()
-                }
-
-                val cipher = if (options.androidAuthenticationValidityDuration != null) {
-                    null
-                } else try {
-                    cipherForMode()
-                } catch (e: Throwable) {
-                    storageFailure(e)?.let { throw it }
-                    throw e
-                }
-
-                if (cipher == null) {
-                    // if we have no cipher, just try the callback and see if the
-                    // user requires authentication.
-                    try {
-                        return cb(null)
-                    } catch (e: Throwable) {
-                        if (!isUserNotAuthenticatedError(e)) {
-                            throw e
-                        }
-                        logger.debug(e) { "User requires (re)authentication. showing prompt ..." }
+                "read" -> withStorage(call, result) { storage ->
+                    executeWithAuthentication(
+                        storage,
+                        CipherMode.Decrypt,
+                        promptInfoProvider(call),
+                        result,
+                    ) { cipher ->
+                        result.success(storage.readFile(cipher))
                     }
                 }
 
-                val promptInfo = getAndroidPromptInfo()
-                authenticate(cipher, promptInfo, options, { authenticatedCipher ->
-                    cb(authenticatedCipher ?: cipher)
-                }, onError = resultError)
-            }
+                "write" -> withStorage(call, result) { storage ->
+                    val content = requiredArgument<String>(call, PARAM_WRITE_CONTENT)
+                    executeWithAuthentication(
+                        storage,
+                        CipherMode.Encrypt,
+                        promptInfoProvider(call),
+                        result,
+                    ) { cipher ->
+                        storage.writeFile(cipher, content)
+                        result.success(true)
+                    }
+                }
 
-            fun parseInitOptions() = call.argument<Map<String, Any>>("options")?.let {
-                InitOptions(
-                    androidAuthenticationValidityDuration = (it["androidAuthenticationValidityDurationSeconds"] as Int?)?.seconds,
-                    authenticationRequired = it["authenticationRequired"] as Boolean,
-                    androidBiometricOnly = it["androidBiometricOnly"] as Boolean,
-                )
-            } ?: InitOptions()
-
-            when (call.method) {
-                "canAuthenticate" -> result.success(canAuthenticate(parseInitOptions()).name)
-                "init" -> {
-                    val name = getName()
-                    if (storageFiles.containsKey(name)) {
-                        if (call.argument<Boolean>("forceInit") == true) {
-                            throw MethodCallException(
-                                "AlreadyInitialized",
-                                "A storage file with the name '$name' was already initialized."
-                            )
+                "delete" -> withStorage(call, result) { storage ->
+                    runOnWorker(result) {
+                        if (storage.exists()) {
+                            result.success(storage.deleteFile())
                         } else {
                             result.success(false)
-                            return
-                        }
-                    }
-
-                    val options = parseInitOptions()
-//                    val options = moshi.adapter(InitOptions::class.java)
-//                        .fromJsonValue(call.argument("options") ?: emptyMap<String, Any>())
-//                        ?: InitOptions()
-                    storageFiles[name] = BiometricStorageFile(applicationContext, name, options)
-                    result.success(true)
-                }
-
-                "dispose" -> storageFiles.remove(getName())?.apply {
-                    dispose()
-                    result.success(true)
-                } ?: throw MethodCallException(
-                    "NoSuchStorage",
-                    "Tried to dispose non existing storage.",
-                    null
-                )
-
-                "read" -> withStorage {
-                    if (exists()) {
-                        withAuth(CipherMode.Decrypt) {
-                            try {
-                                val ret = readFile(it)
-                                ui(resultError) { result.success(ret) }
-                            } catch (e: Throwable) {
-                                storageFailure(e)?.let { failure ->
-                                    ui(resultError) { result.sendStorageFailure(failure) }
-                                } ?: throw e
-                            }
-                        }
-                    } else {
-                        result.success(null)
-                    }
-                }
-
-                "delete" -> withStorage {
-                    if (exists()) {
-                        result.success(deleteFile())
-                    } else {
-                        result.success(false)
-                    }
-                }
-
-                "write" -> withStorage {
-                    withAuth(CipherMode.Encrypt) {
-                        try {
-                            writeFile(it, requiredArgument(PARAM_WRITE_CONTENT))
-                            ui(resultError) { result.success(true) }
-                        } catch (e: Throwable) {
-                            storageFailure(e)?.let { failure ->
-                                ui(resultError) { result.sendStorageFailure(failure) }
-                            } ?: throw e
                         }
                     }
                 }
 
                 else -> result.notImplemented()
             }
-        } catch (e: MethodCallException) {
-            logger.error(e) { "Error while processing method call ${call.method}" }
-            result.error(e.errorCode, e.errorMessage, e.errorDetails)
-        } catch (e: Exception) {
-            logger.error(e) { "Error while processing method call '${call.method}'" }
-            result.error("Unexpected Error", e.message, e.toCompleteString())
+        } catch (e: Throwable) {
+            sendError(result, e, call.method)
         }
     }
 
-    @AnyThread
-    private inline fun ui(
-        @UiThread crossinline onError: ErrorCallback,
-        @UiThread crossinline cb: () -> Unit
-    ) = handler.post {
-        try {
-            cb()
-        } catch (e: Throwable) {
-            logger.error(e) { "Error while calling UI callback. This must not happen." }
-            onError(
-                AuthenticationErrorInfo(
-                    AuthenticationError.Unknown,
-                    "Unexpected authentication error. ${e.localizedMessage}",
-                    e
-                )
-            )
-        }
-    }
-
-    private inline fun worker(
-        @UiThread crossinline onError: ErrorCallback,
-        @WorkerThread crossinline cb: () -> Unit
-    ) = executor.submit {
-        try {
-            cb()
-        } catch (e: Throwable) {
-            logger.error(e) { "Error while calling worker callback. This must not happen." }
-            handler.post {
-                onError(
-                    AuthenticationErrorInfo(
-                        AuthenticationError.Unknown,
-                        "Unexpected authentication error. ${e.localizedMessage}",
-                        e
-                    )
+    private fun initStorage(call: MethodCall, result: MainThreadResult) {
+        val name = requiredArgument<String>(call, PARAM_NAME)
+        if (storageFiles.containsKey(name)) {
+            if (call.argument<Boolean>("forceInit") == true) {
+                throw MethodCallException(
+                    "AlreadyInitialized",
+                    "A storage file with the name '$name' was already initialized.",
                 )
             }
+            result.success(false)
+            return
         }
+        storageFiles[name] = BiometricStorageFile(applicationContext, name, parseInitOptions(call))
+        result.success(true)
     }
 
-    private fun canAuthenticate(initOptions: InitOptions): CanAuthenticateResponse {
-        if (!initOptions.authenticationRequired) {
-            // doesn't really make sense...
-            logger.warn { "called `canAuthenticate` with initOptions.authenticationRequired == false. $initOptions" }
-            return CanAuthenticateResponse.Success
-        }
-        val response = biometricManager.canAuthenticate(
-            if (initOptions.androidBiometricOnly) {
-                BIOMETRIC_STRONG
-            } else {
-                DEVICE_CREDENTIAL or BIOMETRIC_STRONG
-            }
-        )
-        return CanAuthenticateResponse.entries.firstOrNull { it.code == response }
-            ?: throw Exception(
-                "Unknown response code {$response} (available: ${
-                    CanAuthenticateResponse
-                        .entries
-                        .joinToString()
-                }"
-            )
+    private fun disposeStorage(call: MethodCall, result: MainThreadResult) {
+        val name = requiredArgument<String>(call, PARAM_NAME)
+        val storage = storageFiles.remove(name)
+            ?: throw MethodCallException("NoSuchStorage", "Tried to dispose non existing storage.", null)
+        storage.dispose()
+        result.success(true)
     }
 
-    @UiThread
-    private fun authenticate(
-        cipher: Cipher?,
-        promptInfo: AndroidPromptInfo,
-        options: InitOptions,
-        @WorkerThread onSuccess: (cipher: Cipher?) -> Unit,
-        onError: ErrorCallback
+    /**
+     * Runs [task] on the worker after the authentication the storage options
+     * demand succeeded, following the key authorization patterns from
+     * https://developer.android.com/identity/sign-in/biometric-auth
+     */
+    @MainThread
+    private fun executeWithAuthentication(
+        storage: BiometricStorageFile,
+        mode: CipherMode,
+        promptInfo: () -> AndroidPromptInfo,
+        result: MainThreadResult,
+        @WorkerThread task: (cipher: Cipher?) -> Unit,
     ) {
-        logger.trace { "authenticate()" }
-        val activity = attachedActivity ?: return run {
-            logger.error { "We are not attached to an activity." }
-            onError(
-                AuthenticationErrorInfo(
-                    AuthenticationError.Failed,
-                    "Plugin not attached to any activity."
-                )
-            )
+        if (!storage.options.authenticationRequired) {
+            runOnWorker(result) { task(null) }
+            return
         }
-        val prompt =
-            BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    logger.trace { "onAuthenticationError($errorCode, $errString)" }
-                    ui(onError) {
-                        onError(
-                            AuthenticationErrorInfo(
-                                AuthenticationError.forCode(
-                                    errorCode
-                                ), errString
-                            )
-                        )
+
+        if (storage.options.androidAuthenticationValidityDuration != null) {
+            // Time-bound key: it must not be bound to a CryptoObject. Try the
+            // operation first and only show the prompt when the keystore
+            // rejects the key because the validity window expired.
+            runOnWorker(result) {
+                try {
+                    task(null)
+                } catch (e: Throwable) {
+                    if (!isUserNotAuthenticated(e)) throw e
+                    StorageLog.d { "User requires (re)authentication, showing prompt." }
+                    mainHandler.post {
+                        showPrompt(storage, null, promptInfo, result) {
+                            runOnWorker(result) { task(null) }
+                        }
                     }
                 }
-
-                @WorkerThread
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    logger.trace { "onAuthenticationSucceeded($result)" }
-                    worker(onError) { onSuccess(result.cryptoObject?.cipher) }
-                }
-
-                override fun onAuthenticationFailed() {
-                    logger.trace { "onAuthenticationFailed()" }
-                    // this just means the user was not recognised, but the O/S will handle feedback so we don't have to
-                }
-            })
-
-        val promptBuilder = BiometricPrompt.PromptInfo.Builder()
-            .setTitle(promptInfo.title)
-            .setSubtitle(promptInfo.subtitle)
-            .setDescription(promptInfo.description)
-            .setConfirmationRequired(promptInfo.confirmationRequired)
-
-        val biometricOnly =
-            options.androidBiometricOnly || Build.VERSION.SDK_INT < Build.VERSION_CODES.R
-
-        if (biometricOnly) {
-            if (!options.androidBiometricOnly) {
-                logger.debug {
-                    "androidBiometricOnly was false, but prior " +
-                            "to ${Build.VERSION_CODES.R} this was not supported. ignoring."
-                }
             }
-            promptBuilder
-                .setAllowedAuthenticators(BIOMETRIC_STRONG)
-                .setNegativeButtonText(promptInfo.negativeButton)
-        } else {
-            promptBuilder.setAllowedAuthenticators(DEVICE_CREDENTIAL or BIOMETRIC_STRONG)
+            return
         }
 
-        if (cipher == null || options.androidAuthenticationValidityDuration != null) {
-            // if androidAuthenticationValidityDuration is not null we can't use a CryptoObject
-            logger.debug { "Authenticating without cipher. ${options.androidAuthenticationValidityDuration}" }
-            prompt.authenticate(promptBuilder.build())
-        } else {
-            prompt.authenticate(promptBuilder.build(), BiometricPrompt.CryptoObject(cipher))
+        // Auth-per-use key: initialize the cipher up front and authorize
+        // exactly this cipher through the prompt's CryptoObject.
+        runOnWorker(result) {
+            val cipher = when (mode) {
+                CipherMode.Encrypt -> storage.cipherForEncrypt()
+                CipherMode.Decrypt -> storage.cipherForDecrypt()
+            }
+            if (cipher == null) {
+                // Nothing stored yet, so there is nothing to authorize or decrypt.
+                task(null)
+                return@runOnWorker
+            }
+            mainHandler.post {
+                showPrompt(storage, cipher, promptInfo, result) { authenticatedCipher ->
+                    runOnWorker(result) { task(authenticatedCipher ?: cipher) }
+                }
+            }
         }
     }
 
-    private fun isUserNotAuthenticatedError(error: Throwable): Boolean {
-        if (error is UserNotAuthenticatedException) return true
+    @MainThread
+    private fun showPrompt(
+        storage: BiometricStorageFile,
+        cipher: Cipher?,
+        promptInfo: () -> AndroidPromptInfo,
+        result: MainThreadResult,
+        onSuccess: (cipher: Cipher?) -> Unit,
+    ) {
+        try {
+            val activity = attachedActivity
+            if (activity == null) {
+                StorageLog.e("Cannot show a biometric prompt without a foreground FragmentActivity.")
+                result.error(
+                    "AuthError:${AuthenticationError.Failed}",
+                    "Plugin is not attached to a FragmentActivity. " +
+                        "Use FlutterFragmentActivity in your app.",
+                    null,
+                )
+                return
+            }
+            authenticator.authenticate(
+                activity,
+                cipher,
+                promptInfo(),
+                storage.options,
+                onSuccess,
+            ) { errorInfo ->
+                StorageLog.e("AuthError: $errorInfo")
+                result.error(
+                    "AuthError:${errorInfo.error}",
+                    errorInfo.message.toString(),
+                    errorInfo.errorDetails,
+                )
+            }
+        } catch (e: Throwable) {
+            sendError(result, e)
+        }
+    }
 
-        var current: Throwable? = error
-        while (current != null) {
-            if (current is KeyStoreException) {
-                val message = current.message?.lowercase()
-                if (message != null && message.contains("not authenticated")) {
-                    return true
+    private fun runOnWorker(result: MainThreadResult, @WorkerThread body: () -> Unit) {
+        val executor = workerExecutor
+        if (executor == null) {
+            result.error("Unexpected Error", "Plugin is not attached to a Flutter engine.", null)
+            return
+        }
+        try {
+            executor.execute {
+                try {
+                    body()
+                } catch (e: Throwable) {
+                    sendError(result, e)
                 }
             }
-            val message = current.message?.lowercase()
-            if (message != null && message.contains("not authenticated")) {
-                return true
-            }
+        } catch (e: RejectedExecutionException) {
+            sendError(result, e)
+        }
+    }
+
+    private fun sendError(result: MainThreadResult, error: Throwable, method: String? = null) {
+        StorageLog.e("Error while processing method call ${method ?: ""}", error)
+        when {
+            error is MethodCallException ->
+                result.error(error.errorCode, error.errorMessage, error.errorDetails)
+
+            error is CorruptedStorageDataException ->
+                result.error("StorageError:CorruptedData", error.message, error.toCompleteString())
+
+            error is InvalidatedStorageKeyException || error is KeyPermanentlyInvalidatedException ->
+                result.error(
+                    "StorageError:KeyInvalidated",
+                    "The Android Keystore entry was invalidated. " +
+                        "Recreate the storage and write the secret again.",
+                    error.toCompleteString(),
+                )
+
+            else -> result.error("Unexpected Error", error.message, error.toCompleteString())
+        }
+    }
+
+    /**
+     * True when the keystore rejected a time-bound key because the user has to
+     * (re)authenticate. Besides the documented [UserNotAuthenticatedException]
+     * some devices report this wrapped in other keystore exceptions, so the
+     * complete cause chain is checked.
+     */
+    private fun isUserNotAuthenticated(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is UserNotAuthenticatedException) return true
+            if (current.message?.contains("not authenticated", ignoreCase = true) == true) return true
             current = current.cause
         }
-
         return false
     }
 
+    private fun parseInitOptions(call: MethodCall): InitOptions {
+        val options = call.argument<Map<String, Any?>>("options") ?: return InitOptions()
+        return InitOptions(
+            androidAuthenticationValidityDuration =
+                (options["androidAuthenticationValidityDurationSeconds"] as? Number)
+                    ?.toInt()?.seconds,
+            authenticationRequired = options["authenticationRequired"] as? Boolean ?: true,
+            androidBiometricOnly = options["androidBiometricOnly"] as? Boolean ?: true,
+        )
+    }
+
+    /**
+     * Lazy so the prompt info is only required (and validated) for calls that
+     * actually end up showing a prompt.
+     */
+    private fun promptInfoProvider(call: MethodCall): () -> AndroidPromptInfo = {
+        val info = requiredArgument<Map<String, Any?>>(call, PARAM_ANDROID_PROMPT_INFO)
+        AndroidPromptInfo(
+            title = info["title"] as? String
+                ?: throw MethodCallException("MissingArgument", "androidPromptInfo is missing a 'title'."),
+            subtitle = info["subtitle"] as? String,
+            description = info["description"] as? String,
+            negativeButton = info["negativeButton"] as? String
+                ?: throw MethodCallException("MissingArgument", "androidPromptInfo is missing a 'negativeButton'."),
+            confirmationRequired = info["confirmationRequired"] as? Boolean ?: true,
+        )
+    }
+
+    private inline fun withStorage(
+        call: MethodCall,
+        result: MainThreadResult,
+        body: (storage: BiometricStorageFile) -> Unit,
+    ) {
+        val name = requiredArgument<String>(call, PARAM_NAME)
+        val storage = storageFiles[name] ?: run {
+            StorageLog.w("Tried to access storage '$name' before it was initialized.")
+            result.error("NoSuchStorage", "Storage $name was not initialized.", null)
+            return
+        }
+        body(storage)
+    }
+
+    private fun <T> requiredArgument(call: MethodCall, name: String): T =
+        call.argument<T>(name)
+            ?: throw MethodCallException("MissingArgument", "Missing required argument '$name'")
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        updateAttachedActivity(binding.activity)
+    }
+
     override fun onDetachedFromActivity() {
-        logger.trace { "onDetachedFromActivity" }
         attachedActivity = null
     }
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        // The activity is recreated on configuration changes; keep the
+        // reference fresh so prompts never target a destroyed activity.
+        updateAttachedActivity(binding.activity)
     }
 
-    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-        logger.debug { "Attached to new activity." }
-        updateAttachedActivity(binding.activity)
+    override fun onDetachedFromActivityForConfigChanges() {
+        attachedActivity = null
     }
 
     private fun updateAttachedActivity(activity: Activity) {
         if (activity !is FragmentActivity) {
-            logger.error { "Got attached to activity which is not a FragmentActivity: $activity" }
+            StorageLog.e(
+                "Attached activity ${activity.javaClass.name} is not a FragmentActivity. " +
+                    "Biometric prompts require FlutterFragmentActivity.",
+            )
+            attachedActivity = null
             return
         }
         attachedActivity = activity
     }
 
-    override fun onDetachedFromActivityForConfigChanges() {
+    /**
+     * Guarantees every reply is delivered exactly once and on the main thread,
+     * no matter which thread the storage or prompt callbacks finish on.
+     */
+    private inner class MainThreadResult(private val result: Result) : Result {
+
+        private val replied = AtomicBoolean(false)
+
+        override fun success(value: Any?) = reply { result.success(value) }
+
+        override fun error(code: String, message: String?, details: Any?) =
+            reply { result.error(code, message, details) }
+
+        override fun notImplemented() = reply { result.notImplemented() }
+
+        private fun reply(body: () -> Unit) {
+            if (!replied.compareAndSet(false, true)) {
+                StorageLog.w("Ignoring duplicate reply to a method call.")
+                return
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                body()
+            } else {
+                mainHandler.post(body)
+            }
+        }
     }
 }
-
-data class AndroidPromptInfo(
-    val title: String,
-    val subtitle: String?,
-    val description: String?,
-    val negativeButton: String,
-    val confirmationRequired: Boolean
-)

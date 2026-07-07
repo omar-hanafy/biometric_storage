@@ -1,147 +1,141 @@
 package design.codeux.biometric_storage
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.File
 import java.io.IOException
 import javax.crypto.Cipher
-import kotlin.time.Duration
 
-private val logger = KotlinLogging.logger {}
-
-data class InitOptions(
-    val androidAuthenticationValidityDuration: Duration? = null,
-    val authenticationRequired: Boolean = true,
-    val androidBiometricOnly: Boolean = true
-)
-
+/**
+ * One encrypted value persisted in the app's private storage.
+ *
+ * Data lives in `<filesDir>/biometric_storage/<name>.v2.txt`, protected by
+ * the Android Keystore key `_CM_<name>_master_key`. Both paths are a
+ * compatibility contract with previously written data and must not change.
+ */
 class BiometricStorageFile(
     context: Context,
-    baseName: String,
-    val options: InitOptions
+    private val baseName: String,
+    val options: InitOptions,
 ) {
 
     companion object {
-        /**
-         * Name of directory inside private storage where all encrypted files are stored.
-         */
+        /** Directory inside private storage holding all encrypted files. */
         private const val DIRECTORY_NAME = "biometric_storage"
         private const val FILE_SUFFIX_V2 = ".v2.txt"
     }
 
     private val masterKeyName = "${baseName}_master_key"
-    private val fileNameV2 = "$baseName$FILE_SUFFIX_V2"
-    private val fileV2: File
+    private val baseDir = File(context.filesDir, DIRECTORY_NAME)
+    private val file = File(baseDir, "$baseName$FILE_SUFFIX_V2")
+    private val tempFile = File(baseDir, "$baseName$FILE_SUFFIX_V2.tmp")
 
-    private val cryptographyManager = CryptographyManager {
+    private val cryptographyManager = CryptographyManager(context) {
         setUserAuthenticationRequired(options.authenticationRequired)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val useStrongBox = context.packageManager.hasSystemFeature(
-                PackageManager.FEATURE_STRONGBOX_KEYSTORE
-            )
-            setIsStrongBoxBacked(useStrongBox)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (options.androidAuthenticationValidityDuration == null) {
-                setUserAuthenticationParameters(
-                    0,
-                    KeyProperties.AUTH_BIOMETRIC_STRONG
-                )
-            } else {
-                setUserAuthenticationParameters(
-                    options.androidAuthenticationValidityDuration.inWholeSeconds.toInt(),
-                    KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
-                )
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            setUserAuthenticationValidityDurationSeconds(
-                options.androidAuthenticationValidityDuration?.inWholeSeconds?.toInt() ?: -1
-            )
+        if (options.authenticationRequired) {
+            configureUserAuthenticationParameters()
         }
     }
 
     init {
-        val baseDir = File(context.filesDir, DIRECTORY_NAME)
-        if (!baseDir.exists()) {
-            baseDir.mkdirs()
+        require(
+            baseName.isNotEmpty() &&
+                !baseName.contains('/') &&
+                !baseName.contains('\\') &&
+                baseName != "." &&
+                baseName != "..",
+        ) {
+            "Storage name '$baseName' must be a plain file name without path separators."
         }
-        fileV2 = File(baseDir, fileNameV2)
-
-        logger.trace { "Initialized $this with $options" }
-
-        validateOptions()
+        require(!(options.androidAuthenticationValidityDuration == null && !options.androidBiometricOnly)) {
+            "androidBiometricOnly must be true when androidAuthenticationValidityDuration is " +
+                "null: auth-per-use keys can only be unlocked by a strong biometric."
+        }
+        StorageLog.d { "Initialized $this with $options" }
     }
 
-    private fun validateOptions() {
-        if (options.androidAuthenticationValidityDuration == null && !options.androidBiometricOnly) {
-            throw IllegalArgumentException("when androidAuthenticationValidityDuration is null, androidBiometricOnly must be true")
+    /**
+     * Applies the Google recommended key authorization for the configured mode:
+     * auth-per-use keys bound to strong biometrics when no validity duration is
+     * set, otherwise a time-bound key that also accepts the device credential.
+     */
+    private fun KeyGenParameterSpec.Builder.configureUserAuthenticationParameters() {
+        val validity = options.androidAuthenticationValidityDuration
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (validity == null) {
+                setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+            } else {
+                setUserAuthenticationParameters(
+                    validity.inWholeSeconds.toInt(),
+                    KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG,
+                )
+            }
+        } else {
+            // Pre Android 11 fallback; -1 requires a biometric for every use.
+            @Suppress("DEPRECATION")
+            setUserAuthenticationValidityDurationSeconds(
+                validity?.inWholeSeconds?.toInt() ?: -1,
+            )
         }
     }
 
-    fun cipherForEncrypt() = cryptographyManager.getInitializedCipherForEncryption(masterKeyName)
+    fun cipherForEncrypt(): Cipher =
+        cryptographyManager.getInitializedCipherForEncryption(masterKeyName)
+
+    /** Returns null when no stored payload exists (no IV to initialize with). */
     fun cipherForDecrypt(): Cipher? {
-        if (fileV2.exists()) {
-            return cryptographyManager.getInitializedCipherForDecryption(masterKeyName, fileV2)
+        if (!file.exists()) {
+            StorageLog.d { "No stored file for $this, no IV to derive a decryption cipher from." }
+            return null
         }
-        logger.debug { "No file exists, no IV found. null cipher." }
-        return null
+        return cryptographyManager.getInitializedCipherForDecryption(masterKeyName, file)
     }
 
-    fun exists() = fileV2.exists()
+    fun exists(): Boolean = file.exists()
 
     @Synchronized
     fun writeFile(cipher: Cipher?, content: String) {
-        // cipher will be null if user does not need authentication or valid period is > -1
+        // cipher is null when authentication is not required or a time-bound
+        // key is used; in that case the cipher is created on demand.
         val useCipher = cipher ?: cipherForEncrypt()
-        try {
-            val encrypted = cryptographyManager.encryptData(content, useCipher)
-            fileV2.writeBytes(encrypted.encryptedPayload)
-            logger.debug { "Successfully written ${encrypted.encryptedPayload.size} bytes." }
-
-            return
-        } catch (ex: IOException) {
-            // Error occurred opening file for writing.
-            logger.error(ex) { "Error while writing encrypted file $fileV2" }
-            throw ex
+        val payload = cryptographyManager.encryptData(content, useCipher)
+        baseDir.mkdirs()
+        if (!baseDir.isDirectory) {
+            throw IOException("Unable to create storage directory $baseDir.")
         }
+        // Write to a temporary file first so a crash mid-write can never
+        // corrupt a previously stored value.
+        tempFile.writeBytes(payload)
+        if (!tempFile.renameTo(file)) {
+            tempFile.delete()
+            throw IOException("Unable to move temporary storage file into place for $file.")
+        }
+        StorageLog.d { "Successfully wrote ${payload.size} bytes to $file." }
     }
 
     @Synchronized
     fun readFile(cipher: Cipher?): String? {
-        val useCipher = cipher ?: cipherForDecrypt()
-        // if the file exists, there should *always* be a decryption key.
-        if (useCipher != null && fileV2.exists()) {
-            return try {
-                val bytes = fileV2.readBytes()
-                logger.debug { "read ${bytes.size}" }
-                cryptographyManager.decryptData(bytes, useCipher)
-            } catch (ex: IOException) {
-                logger.error(ex) { "Error while reading encrypted file $fileV2" }
-                null
-            }
+        if (!file.exists()) {
+            StorageLog.d { "File $file does not exist, returning null." }
+            return null
         }
-
-        logger.debug { "File $fileV2 does not exist. returning null." }
-        return null
-
+        val useCipher = cipher ?: cipherForDecrypt() ?: return null
+        return cryptographyManager.decryptData(file.readBytes(), useCipher)
     }
 
     @Synchronized
     fun deleteFile(): Boolean {
         cryptographyManager.deleteKey(masterKeyName)
-        return fileV2.delete()
-    }
-
-    override fun toString(): String {
-        return "BiometricStorageFile(masterKeyName='$masterKeyName', fileName='$fileNameV2', file=$fileV2)"
+        tempFile.delete()
+        return file.delete()
     }
 
     fun dispose() {
-        logger.trace { "dispose" }
+        StorageLog.d { "dispose($this)" }
     }
 
+    override fun toString(): String =
+        "BiometricStorageFile(masterKeyName='$masterKeyName', file=$file)"
 }
